@@ -1316,6 +1316,12 @@ static int decode_tiles(AVCodecContext *avctx,
     bytesperpixel = s->bytesperpixel;
 
     yoff = uvoff = 0;
+#if CONFIG_WEBGPU
+    // Begin frame decode with mapped GPU buffer for ZERO-COPY coefficient accumulation
+    if (s->webgpu_ctx) {
+        ff_vp9_webgpu_begin_frame(s->webgpu_ctx);
+    }
+#endif
     for (tile_row = 0; tile_row < s->s.h.tiling.tile_rows; tile_row++) {
         set_tile_offset(&tile_row_start, &tile_row_end,
                         tile_row, s->s.h.tiling.log2_tile_rows, s->sb_rows);
@@ -1388,10 +1394,7 @@ static int decode_tiles(AVCodecContext *avctx,
                     }
                 }
 #if CONFIG_WEBGPU
-                // Flush WebGPU batch after each row of superblocks to accumulate more transforms
-                if (s->webgpu_ctx) {
-                    ff_vp9_webgpu_flush_batch(s->webgpu_ctx, s);
-                }
+                // Don't flush here - accumulate for entire frame
 #endif
             }
 
@@ -1492,10 +1495,7 @@ int decode_tiles_mt(AVCodecContext *avctx, void *tdata, int jobnr,
             }
 
 #if CONFIG_WEBGPU
-            // Flush WebGPU batch after each row of superblocks
-            if (s->webgpu_ctx) {
-                ff_vp9_webgpu_flush_batch(s->webgpu_ctx, s);
-            }
+            // Don't flush here - accumulate for entire frame
 #endif
 
             // backup pre-loopfilter reconstruction data for intra
@@ -1713,6 +1713,10 @@ static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     }
 
     // main tile decode loop
+#if CONFIG_WEBGPU
+    // DO NOT start old batch here - we use tile processing now!
+    // Tiles will be processed at the end with zero-copy superblock approach
+#endif
     memset(s->above_partition_ctx, 0, s->cols);
     memset(s->above_skip_ctx, 0, s->cols);
     if (s->s.h.keyframe || s->s.h.intraonly) {
@@ -1833,6 +1837,12 @@ static int vp9_decode_frame(AVCodecContext *avctx, AVFrame *frame,
     }
 
 finish:
+#if CONFIG_WEBGPU
+    // End frame and submit accumulated superblocks to GPU (ZERO-COPY!)
+    if (s->webgpu_ctx) {
+        ff_vp9_webgpu_end_frame(s->webgpu_ctx, s);
+    }
+#endif
     ff_cbs_fragment_reset(&s->current_frag);
 
     ff_progress_frame_report(&s->s.frames[CUR_FRAME].tf, INT_MAX);

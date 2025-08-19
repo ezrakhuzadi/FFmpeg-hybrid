@@ -25,6 +25,7 @@
 
 #include <webgpu.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #include "libavutil/buffer.h"
 #include "libavutil/hwcontext.h"
@@ -34,6 +35,44 @@
 
 // Forward declarations
 typedef struct VP9Context VP9Context;
+typedef struct VP9SuperblockGPU VP9SuperblockGPU;
+
+// Zero-copy buffer system for unified memory
+typedef struct {
+    WGPUBuffer persistent_mapped;     // Always mapped, never unmap
+    void *cpu_ptr;                    // Direct CPU write pointer
+    WGPUBuffer gpu_storage;           // GPU reads from here
+    size_t size;
+    int is_mapped;
+} ZeroCopyBuffer;
+
+// Structure-of-Arrays for GPU coalesced access (128-byte aligned)
+typedef struct __attribute__((aligned(128))) {
+    // Pack data for optimal GPU memory access
+    int16_t all_coefficients[8192][1024];  // All coeffs together (8K max SBs)
+    uint32_t all_modes[8192];              // All modes together  
+    int16_t all_mvs[8192][2];              // All motion vectors together
+    uint32_t partition_masks[8192];        // All partitions together
+    uint32_t transform_masks[8192];        // All transform masks
+    uint32_t sb_x_coords[8192];            // X coordinates
+    uint32_t sb_y_coords[8192];            // Y coordinates
+    uint32_t sb_count;                     // Active superblocks
+} SOA_SuperblockData;
+
+// Lockless ring buffer for CPU-GPU communication
+typedef struct {
+    struct VP9SuperblockGPU *ring_buffer;  // Dynamic allocation
+    _Atomic uint64_t write_index;          // CPU writes here
+    _Atomic uint64_t read_index;           // GPU reads from here
+    char padding[64];                      // Cache line separation
+} LocklessRingBuffer;
+
+// Dynamic workgroup configuration
+typedef struct {
+    uint32_t vendor_optimal_size;     // 32 Intel, 64 AMD, 128 NVIDIA
+    uint32_t resolution_multiplier;   // Larger for higher res
+    uint32_t memory_bandwidth_factor; // Adjust based on memory speed
+} DynamicWorkgroupConfig;
 
 // Transform block metadata (matches WGSL struct)
 typedef struct VP9WebGPUTransformBlock {
@@ -44,22 +83,94 @@ typedef struct VP9WebGPUTransformBlock {
     uint32_t _pad[2];
 } VP9WebGPUTransformBlock;
 
+// Superblock metadata for GPU processing - matches Intel's approach
+typedef struct VP9SuperblockGPU {
+    int16_t coeffs[64*64];         // Entire superblock coefficients
+    int32_t x, y;                  // Superblock position in pixels
+    int32_t mode;                  // Prediction mode
+    int16_t motion_vectors[2];     // Motion vectors for MC
+    uint32_t partition_mask;       // How the superblock is partitioned
+    uint32_t transform_mask;       // Which transforms are present
+} VP9SuperblockGPU;
+
+// Transform within a superblock
+typedef struct VP9WebGPUSuperblockTransform {
+    uint32_t local_x, local_y;     // Position within superblock (0-63)
+    uint32_t tx_size;              // Transform size
+    uint32_t tx_type;              // Transform type
+    uint32_t coeff_offset;         // Offset into coefficient buffer
+    uint32_t eob;                  // End of block
+    uint32_t _pad[2];
+} VP9WebGPUSuperblockTransform;
+
+// Triple-buffered frame pipeline
+typedef struct {
+    ZeroCopyBuffer frame_buffers[3];
+    WGPUCommandBuffer pending_commands[3];
+    _Atomic int cpu_frame_idx;     // CPU working on this frame
+    _Atomic int gpu_frame_idx;     // GPU working on this frame
+    _Atomic int display_frame_idx; // Ready for display
+} TripleBufferPipeline;
+
+// Universal pre-compiled pipeline cache
+typedef enum {
+    RESOLUTION_1080P, RESOLUTION_4K, RESOLUTION_8K,
+    GPU_INTEGRATED, GPU_DISCRETE_MID, GPU_DISCRETE_HIGH,
+    MEMORY_UNIFIED, MEMORY_DISCRETE
+} ShaderVariant;
+
+typedef struct {
+    WGPUComputePipeline pipelines[3][3][2]; // [resolution][gpu_tier][memory_type]
+    uint32_t optimal_workgroup_sizes[3][3][2];
+    uint32_t optimal_batch_sizes[3][3][2];
+} UniversalPipelineCache;
+
+// Intelligent reference frame cache
+typedef struct {
+    WGPUTexture reference_frames[8];      // VP9 allows up to 8 refs
+    WGPUTexture prediction_cache[64];     // Cache common prediction blocks
+    uint64_t frame_usage_stats[8];        // Track which refs are used most
+    uint32_t prediction_hit_count[64];    // Track prediction cache hits
+} IntelligentFrameCache;
+
 typedef struct VP9WebGPUContext {
     AVBufferRef *device_ref;
     AVWebGPUDeviceContext *device_ctx;
     
-    // WebGPU compute pipelines
+    // NEW: Zero-copy buffer system
+    ZeroCopyBuffer *persistent_buffers;
+    SOA_SuperblockData *soa_data;
+    LocklessRingBuffer *ring_buffer;
+    
+    // NEW: Triple-buffered pipeline
+    TripleBufferPipeline triple_buffer;
+    
+    // NEW: Pre-compiled shader cache
+    UniversalPipelineCache shader_cache;
+    
+    // NEW: Reference frame cache
+    IntelligentFrameCache ref_cache;
+    
+    // NEW: Dynamic workgroup config
+    DynamicWorkgroupConfig workgroup_config;
+    
+    // NEW: Mega kernel for complete decode
+    WGPUComputePipeline mega_kernel_pipeline;
+    
+    // WebGPU compute pipelines (legacy - will be replaced by mega kernel)
     WGPUComputePipeline idct4x4_pipeline;
     WGPUComputePipeline idct8x8_pipeline;
     WGPUComputePipeline idct16x16_pipeline;
     WGPUComputePipeline idct32x32_pipeline;
     WGPUComputePipeline mc_pipeline;
     WGPUComputePipeline loopfilter_pipeline;
+    WGPUComputePipeline superblock_pipeline;  // New superblock processing pipeline
     
     // Bind group layouts
     WGPUBindGroupLayout idct_bind_group_layout;
     WGPUBindGroupLayout mc_bind_group_layout;
     WGPUBindGroupLayout loopfilter_bind_group_layout;
+    WGPUBindGroupLayout superblock_bind_group_layout;
     
     // Persistent buffers for metadata
     WGPUBuffer transform_blocks_buffer;
@@ -69,6 +180,16 @@ typedef struct VP9WebGPUContext {
     
     // Frame info uniform buffer
     WGPUBuffer frame_info_buffer;
+    
+    // MEGA KERNEL persistent resources
+    WGPUBuffer mega_uniform_buffer;      // Frame info for mega kernel
+    WGPUBuffer mega_superblock_buffer;   // Superblock data buffer
+    WGPUBuffer mega_frame_buffer;        // Output frame buffer
+    WGPUTexture mega_ref_texture;        // Reference frame texture
+    WGPUTextureView mega_ref_view;       // Reference frame view
+    WGPUSampler mega_sampler;            // Texture sampler
+    WGPUBindGroup mega_bind_group;       // Persistent bind group
+    int mega_resources_initialized;      // Whether resources are created
     
     // Working buffers (allocated per frame)
     WGPUBuffer coefficients_buffer;
@@ -156,6 +277,51 @@ typedef struct VP9WebGPUContext {
         int active;
     } thread_contexts[16];  // Support up to 16 threads
     int num_threads;
+    
+    // Tile-level superblock batching (Intel-style)
+    struct {
+        VP9SuperblockGPU *superblocks;
+        int num_superblocks;
+        int capacity_sb;
+        
+        // Current superblock being accumulated
+        VP9SuperblockGPU current_sb;
+        int current_sb_x, current_sb_y;
+        int has_coeffs;  // Whether current SB has any non-zero coeffs
+        
+        // Storage for all accumulated superblocks during frame decode
+        VP9SuperblockGPU *accumulated_sbs;
+        int accumulated_count;
+        int accumulated_capacity;
+        
+        // Direct mapped GPU buffer for zero-copy accumulation
+        WGPUBuffer direct_map_buffer;
+        VP9SuperblockGPU *mapped_sbs;  // Direct pointer to GPU memory
+        int is_mapped;
+        
+        // Zero-copy ring buffers (two-buffer strategy)
+        struct {
+            WGPUBuffer mappable;    // CPU writes here (MapWrite | CopySrc)
+            WGPUBuffer storage;     // GPU reads here (Storage | CopyDst)
+            void *mapped_ptr;       // Mapped pointer for zero-copy writes
+            int is_mapped;
+        } ring_buffers[3];  // Triple buffering
+        
+        int write_index;
+        int read_index;
+        
+        // Synchronization
+        pthread_mutex_t ring_mutex;
+        pthread_cond_t gpu_ready;
+        pthread_cond_t cpu_ready;
+    } tile_batch;
+    
+    // GPU buffers for superblock processing
+    WGPUBuffer sb_info_buffer;
+    WGPUBuffer sb_transform_buffer;
+    WGPUBuffer sb_coeff_buffer;
+    WGPUBuffer frame_buffer;
+    WGPUBuffer prediction_buffer;
 } VP9WebGPUContext;
 
 // Motion compensation block metadata
@@ -251,5 +417,65 @@ int ff_vp9_webgpu_execute_transform_batch(VP9WebGPUContext *ctx,
 int ff_vp9_webgpu_process_tile_row(VP9WebGPUContext *ctx, VP9Context *s,
                                    uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
                                    int row_start, int row_end);
+
+// Process entire tile on GPU (Intel-style)
+int ff_vp9_webgpu_process_tile(VP9WebGPUContext *ctx, VP9Context *s,
+                               int tile_row, int tile_col);
+
+// Apply GPU results to frame
+int ff_vp9_webgpu_apply_tile_results(VP9WebGPUContext *ctx, VP9Context *s,
+                                     const void *gpu_data, size_t data_size);
+
+// Submit tile batch for GPU processing
+int ff_vp9_webgpu_submit_tile_batch(VP9WebGPUContext *ctx, 
+                                    VP9SuperblockGPU *superblocks, 
+                                    int sb_count, VP9Context *s);
+
+// Submit tile batch directly from mapped buffer (zero-copy)
+int ff_vp9_webgpu_submit_tile_batch_direct(VP9WebGPUContext *ctx,
+                                           WGPUBuffer mapped_buffer,
+                                           int sb_count, VP9Context *s);
+
+// Extract superblock data for GPU
+void ff_vp9_webgpu_extract_superblock_data(VP9Context *s, 
+                                           int sb_x, int sb_y,
+                                           VP9SuperblockGPU *sb_gpu);
+
+// Accumulate block coefficients into current superblock
+void ff_vp9_webgpu_accumulate_block_coeffs(VP9WebGPUContext *ctx,
+                                           int block_x, int block_y,
+                                           int16_t *coeffs, int size,
+                                           int tx, int plane);
+
+// Begin frame decode with mapped GPU buffer for zero-copy
+int ff_vp9_webgpu_begin_frame(VP9WebGPUContext *ctx);
+
+// End frame decode and submit to GPU
+int ff_vp9_webgpu_end_frame(VP9WebGPUContext *ctx, VP9Context *s);
+
+// NEW: Zero-copy functions
+int ff_vp9_webgpu_init_zero_copy_buffers(VP9WebGPUContext *ctx, int width, int height);
+void ff_vp9_webgpu_destroy_zero_copy_buffers(VP9WebGPUContext *ctx);
+void ff_vp9_webgpu_decode_coefficients_zero_copy(VP9Context *s, ZeroCopyBuffer *buf);
+
+// NEW: Lockless ring buffer functions
+void ff_vp9_webgpu_cpu_write_coefficients(LocklessRingBuffer *ring, VP9SuperblockGPU *data);
+uint32_t ff_vp9_webgpu_gpu_read_superblock_batch(LocklessRingBuffer *ring, VP9SuperblockGPU *batch, uint32_t max_batch_size);
+
+// NEW: Dynamic optimization functions
+uint32_t ff_vp9_webgpu_calculate_optimal_workgroup_size(VP9WebGPUContext *ctx, int width, int height);
+uint32_t ff_vp9_webgpu_calculate_optimal_batch_size(VP9WebGPUContext *ctx, int width, int height);
+
+// NEW: Pre-compiled shader selection
+WGPUComputePipeline ff_vp9_webgpu_select_optimal_pipeline(UniversalPipelineCache *cache, int width, int height);
+
+// NEW: Frame-level mega dispatch
+void ff_vp9_webgpu_dispatch_complete_frame(VP9WebGPUContext *ctx, VP9Context *s);
+
+// NEW: Triple-buffered pipeline
+void ff_vp9_webgpu_async_decode_pipeline(VP9WebGPUContext *ctx, VP9Context *s);
+
+// NEW: Reference frame caching
+void ff_vp9_webgpu_update_reference_cache_strategy(IntelligentFrameCache *cache, VP9Context *s);
 
 #endif /* AVCODEC_VP9_WEBGPU_H */
