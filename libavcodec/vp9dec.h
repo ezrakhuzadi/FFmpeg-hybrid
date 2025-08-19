@@ -40,6 +40,10 @@
 #include "vpx_rac.h"
 #include "cbs_vp9.h"
 
+#if CONFIG_WEBGPU
+#include "vp9_webgpu.h"
+#endif
+
 #define REF_INVALID_SCALE 0xFFFF
 
 enum MVJoint {
@@ -105,6 +109,10 @@ typedef struct VP9Context {
 
     VP9DSPContext dsp;
     VideoDSPContext vdsp;
+    
+#if CONFIG_WEBGPU
+    VP9WebGPUContext *webgpu_ctx;
+#endif
     GetBitContext gb;
     VPXRangeCoder c;
     int pass, active_tile_cols;

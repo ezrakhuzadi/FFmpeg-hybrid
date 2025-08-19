@@ -36,6 +36,31 @@ static void FN(inter_pred)(VP9TileData *td)
     const VP9Context *s = td->s;
     VP9Block *b = td->b;
     int row = td->row, col = td->col;
+    
+#if CONFIG_WEBGPU
+    // Try WebGPU motion compensation acceleration
+    if (s->webgpu_ctx) {
+        VP9WebGPUMCBlock mc_block = {0};
+        
+        // Set up motion compensation parameters
+        mc_block.block_x = col;
+        mc_block.block_y = row;
+        mc_block.block_size = b->bs;
+        mc_block.mv[0].mv_x = b->mv[0][0].x;
+        mc_block.mv[0].mv_y = b->mv[0][0].y;
+        mc_block.mv[0].ref_frame = b->ref[0];
+        mc_block.mode = b->mode[0];
+        mc_block.ss_x = s->ss_h;
+        mc_block.ss_y = s->ss_v;
+        
+        // Try WebGPU motion compensation
+        int ret = ff_vp9_webgpu_motion_compensation(s->webgpu_ctx, (VP9Context *)s, &mc_block, 1);
+        if (ret == 0) {
+            return; // WebGPU motion compensation succeeded
+        }
+        // Fall through to CPU implementation on failure
+    }
+#endif
     const ProgressFrame *tref1 = &s->s.refs[s->s.h.refidx[b->ref[0]]], *tref2;
     const AVFrame *ref1 = tref1->f, *ref2;
     int w1 = ref1->width, h1 = ref1->height, w2, h2;

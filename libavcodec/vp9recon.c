@@ -30,6 +30,10 @@
 #include "vp9data.h"
 #include "vp9dec.h"
 
+#if CONFIG_WEBGPU
+#include "vp9_webgpu.h"
+#endif
+
 static av_always_inline int check_intra_mode(VP9TileData *td, int mode, uint8_t **a,
                                              uint8_t *dst_edge, ptrdiff_t stride_edge,
                                              uint8_t *dst_inner, ptrdiff_t stride_inner,
@@ -216,6 +220,39 @@ static av_always_inline int check_intra_mode(VP9TileData *td, int mode, uint8_t 
     return mode;
 }
 
+#if CONFIG_WEBGPU
+static av_always_inline int try_webgpu_transform(VP9TileData *td, uint8_t *ptr, ptrdiff_t stride,
+                                                 int16_t *coeffs, int eob, enum TxfmMode tx, enum TxfmType txtp)
+{
+    const VP9Context *s = td->s;
+    
+    // Early exit if WebGPU context not available
+    if (!s || !s->webgpu_ctx) {
+        return 0; // Fall back to CPU
+    }
+    
+    // Only use WebGPU for DCT transforms currently (most common)
+    if (txtp != DCT_DCT) {
+        return 0; // Fall back to CPU for non-DCT transforms
+    }
+    
+    // Validate transform parameters
+    if (!coeffs || eob <= 0 || tx > 3) {
+        return 0; // Invalid parameters, fall back to CPU
+    }
+    
+    // Try to perform WebGPU inverse transform with transform type
+    int ret = ff_vp9_webgpu_inverse_transform_type(s->webgpu_ctx, ptr, stride, coeffs, eob, tx, txtp, 0);
+    if (ret == 0) {
+        // WebGPU transform succeeded
+        return 1;
+    }
+    
+    // WebGPU transform failed, fall back to CPU
+    return 0;
+}
+#endif
+
 static av_always_inline void intra_recon(VP9TileData *td, ptrdiff_t y_off,
                                          ptrdiff_t uv_off, int bytesperpixel)
 {
@@ -247,9 +284,14 @@ static av_always_inline void intra_recon(VP9TileData *td, ptrdiff_t y_off,
                                     ptr, td->y_stride, l,
                                     col, x, w4, row, y, b->tx, 0, 0, 0, bytesperpixel);
             s->dsp.intra_pred[b->tx][mode](ptr, td->y_stride, l, a);
-            if (eob)
+            if (eob) {
+#if CONFIG_WEBGPU
+                if (!try_webgpu_transform(td, ptr, td->y_stride, 
+                                        (int16_t*)(td->block + 16 * n * bytesperpixel), eob, tx, txtp))
+#endif
                 s->dsp.itxfm_add[tx][txtp](ptr, td->y_stride,
                                            td->block + 16 * n * bytesperpixel, eob);
+            }
         }
         dst_r += 4 * step1d * s->s.frames[CUR_FRAME].tf.f->linesize[0];
         dst   += 4 * step1d * td->y_stride;
@@ -276,9 +318,23 @@ static av_always_inline void intra_recon(VP9TileData *td, ptrdiff_t y_off,
                                         ptr, td->uv_stride, l, col, x, w4, row, y,
                                         b->uvtx, p + 1, s->ss_h, s->ss_v, bytesperpixel);
                 s->dsp.intra_pred[b->uvtx][mode](ptr, td->uv_stride, l, a);
-                if (eob)
+                if (eob) {
+#if CONFIG_WEBGPU
+                    // Try WebGPU transform for chroma plane (p+1 because 0=Y, 1=U, 2=V)
+                    int webgpu_done = 0;
+                    if (s->webgpu_ctx) {
+                        int ret = ff_vp9_webgpu_inverse_transform_plane(s->webgpu_ctx, ptr, td->uv_stride,
+                                                                       (int16_t*)(td->uvblock[p] + 16 * n * bytesperpixel), 
+                                                                       eob, b->uvtx, p + 1);
+                        if (ret == 0) {
+                            webgpu_done = 1; // WebGPU succeeded
+                        }
+                    }
+                    if (!webgpu_done)
+#endif
                     s->dsp.itxfm_add[uvtx][DCT_DCT](ptr, td->uv_stride,
                                                     td->uvblock[p] + 16 * n * bytesperpixel, eob);
+                }
             }
             dst_r += 4 * uvstep1d * s->s.frames[CUR_FRAME].tf.f->linesize[1];
             dst   += 4 * uvstep1d * td->uv_stride;
@@ -623,9 +679,14 @@ static av_always_inline void inter_recon(VP9TileData *td, int bytesperpixel)
                  ptr += 4 * step1d * bytesperpixel, n += step) {
                 int eob = b->tx > TX_8X8 ? AV_RN16A(&td->eob[n]) : td->eob[n];
 
-                if (eob)
+                if (eob) {
+#if CONFIG_WEBGPU
+                    if (!try_webgpu_transform(td, ptr, td->y_stride,
+                                            (int16_t*)(td->block + 16 * n * bytesperpixel), eob, tx, DCT_DCT))
+#endif
                     s->dsp.itxfm_add[tx][DCT_DCT](ptr, td->y_stride,
                                                   td->block + 16 * n * bytesperpixel, eob);
+                }
             }
             dst += 4 * td->y_stride * step1d;
         }
@@ -642,9 +703,14 @@ static av_always_inline void inter_recon(VP9TileData *td, int bytesperpixel)
                      ptr += 4 * uvstep1d * bytesperpixel, n += step) {
                     int eob = b->uvtx > TX_8X8 ? AV_RN16A(&td->uveob[p][n]) : td->uveob[p][n];
 
-                    if (eob)
+                    if (eob) {
+#if CONFIG_WEBGPU
+                        if (!try_webgpu_transform(td, ptr, td->uv_stride,
+                                                (int16_t*)(td->uvblock[p] + 16 * n * bytesperpixel), eob, uvtx, DCT_DCT))
+#endif
                         s->dsp.itxfm_add[uvtx][DCT_DCT](ptr, td->uv_stride,
                                                         td->uvblock[p] + 16 * n * bytesperpixel, eob);
+                    }
                 }
                 dst += 4 * uvstep1d * td->uv_stride;
             }

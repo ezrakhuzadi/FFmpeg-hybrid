@@ -24,6 +24,10 @@
 #include "avcodec.h"
 #include "vp9dec.h"
 
+#if CONFIG_WEBGPU
+#include "vp9_webgpu.h"
+#endif
+
 static av_always_inline void filter_plane_cols(VP9Context *s, int col, int ss_h, int ss_v,
                                                uint8_t *lvl, uint8_t (*mask)[4],
                                                uint8_t *dst, ptrdiff_t ls)
@@ -180,6 +184,29 @@ void ff_vp9_loopfilter_sb(AVCodecContext *avctx, VP9Filter *lflvl,
                           int row, int col, ptrdiff_t yoff, ptrdiff_t uvoff)
 {
     VP9Context *s = avctx->priv_data;
+    
+#if CONFIG_WEBGPU
+    // Try WebGPU loop filtering acceleration
+    if (s->webgpu_ctx) {
+        VP9WebGPULoopFilterBlock lf_block = {0};
+        
+        // Set up loop filter parameters
+        for (int i = 0; i < 4; i++) {
+            lf_block.level[i] = lflvl->level[i];
+        }
+        lf_block.sharpness = 0; // Use default sharpness
+        lf_block.filter_type = 0; // Normal filter
+        lf_block.boundary_flags = 0; // Calculate based on position
+        
+        // Try WebGPU loop filtering
+        int ret = ff_vp9_webgpu_loop_filter(s->webgpu_ctx, s, &lf_block, 1);
+        if (ret == 0) {
+            return; // WebGPU loop filtering succeeded
+        }
+        // Fall through to CPU implementation on failure
+    }
+#endif
+    
     AVFrame *f = s->s.frames[CUR_FRAME].tf.f;
     uint8_t *dst = f->data[0] + yoff;
     ptrdiff_t ls_y = f->linesize[0], ls_uv = f->linesize[1];

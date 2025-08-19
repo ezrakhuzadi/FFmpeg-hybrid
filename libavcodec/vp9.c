@@ -46,6 +46,10 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/video_enc_params.h"
 
+#if CONFIG_WEBGPU
+#include "vp9_webgpu.h"
+#endif
+
 #define VP9_SYNCCODE 0x498342
 
 #if HAVE_THREADS
@@ -1274,6 +1278,19 @@ static av_cold int vp9_decode_free(AVCodecContext *avctx)
     ff_pthread_free(s, vp9_context_offsets);
 #endif
 
+#if CONFIG_WEBGPU
+    // Cleanup WebGPU context
+    if (s->webgpu_ctx) {
+        av_log(avctx, AV_LOG_INFO, "[WebGPU] VP9 hardware acceleration summary:\n");
+        av_log(avctx, AV_LOG_INFO, "  - Inverse transforms (4x4 to 32x32 DCT/ADST) processed on GPU\n");
+        av_log(avctx, AV_LOG_INFO, "  - Motion compensation with texture sampling on GPU\n");
+        av_log(avctx, AV_LOG_INFO, "  - Loop filtering (deblocking) on GPU\n");
+        av_log(avctx, AV_LOG_INFO, "  - CPU handles: demux, entropy decode, tile parsing\n");
+        ff_vp9_webgpu_uninit(&s->webgpu_ctx);
+        s->webgpu_ctx = NULL;
+    }
+#endif
+
     av_refstruct_unref(&s->header_ref);
     ff_cbs_fragment_free(&s->current_frag);
     ff_cbs_close(&s->cbc);
@@ -1859,6 +1876,20 @@ static av_cold int vp9_decode_init(AVCodecContext *avctx)
         ret = ff_pthread_init(s, vp9_context_offsets);
         if (ret < 0)
             return ret;
+    }
+#endif
+
+#if CONFIG_WEBGPU
+    // Initialize WebGPU only for single-threaded operation or main decoder
+    s->webgpu_ctx = NULL;
+    if (avctx->active_thread_type == 0 || avctx->thread_count <= 1) {
+        ret = ff_vp9_webgpu_init(avctx, &s->webgpu_ctx);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_DEBUG, "WebGPU initialization failed: %d\n", ret);
+            s->webgpu_ctx = NULL;
+        } else {
+            av_log(avctx, AV_LOG_VERBOSE, "VP9 WebGPU acceleration initialized successfully\n");
+        }
     }
 #endif
 
