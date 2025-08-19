@@ -7529,10 +7529,12 @@ else
         check_cpp_condition vulkan_1_4 "vulkan/vulkan.h" "defined(VK_VERSION_1_5) || (defined(VK_VERSION_1_4) && VK_HEADER_VERSION >= 317)"
 fi
 
-enabled webgpu &&
-    { check_pkg_config webgpu "wgpu-native" "webgpu/webgpu.h" "wgpuCreateInstance" ||
-      check_lib webgpu "webgpu/webgpu.h" wgpuCreateInstance -lwgpu_native ||
-      check_lib webgpu "webgpu.h" wgpuCreateInstance -lwgpu_native; }
+enabled webgpu && {
+    add_cppflags "-I/home/linuxbrew/.linuxbrew/include"
+    add_ldflags "-L/home/linuxbrew/.linuxbrew/lib"
+    check_lib webgpu "webgpu/webgpu.h" wgpuCreateInstance -lwgpu_native ||
+    die "WebGPU not found with wgpu-native library"
+}
 
 if enabled x86; then
     case $target_os in

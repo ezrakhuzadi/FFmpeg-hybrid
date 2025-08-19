@@ -1387,6 +1387,12 @@ static int decode_tiles(AVCodecContext *avctx,
                                   yoff2, uvoff2, BL_64X64);
                     }
                 }
+#if CONFIG_WEBGPU
+                // Flush WebGPU batch after each row of superblocks to accumulate more transforms
+                if (s->webgpu_ctx) {
+                    ff_vp9_webgpu_flush_batch(s->webgpu_ctx, s);
+                }
+#endif
             }
 
             if (s->pass == 1)
@@ -1484,6 +1490,13 @@ int decode_tiles_mt(AVCodecContext *avctx, void *tdata, int jobnr,
                 decode_sb(td, row, col, lflvl_ptr,
                             yoff2, uvoff2, BL_64X64);
             }
+
+#if CONFIG_WEBGPU
+            // Flush WebGPU batch after each row of superblocks
+            if (s->webgpu_ctx) {
+                ff_vp9_webgpu_flush_batch(s->webgpu_ctx, s);
+            }
+#endif
 
             // backup pre-loopfilter reconstruction data for intra
             // prediction of next row of sb64s

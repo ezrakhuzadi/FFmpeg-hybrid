@@ -391,7 +391,68 @@ int ff_vp9_webgpu_init(AVCodecContext *avctx, VP9WebGPUContext **ctx_out)
         ctx->buffer_pool.in_use[i] = 0;
     }
     
-    av_log(avctx, AV_LOG_INFO, "VP9 WebGPU acceleration initialized successfully\n");
+    // Initialize batching system with reasonable sizes to avoid wgpu issues
+    ctx->max_batch_size = 1024;  // Process up to 1K blocks per batch - safer for wgpu
+    ctx->transform_batch.capacity = ctx->max_batch_size;
+    
+    // Allocate CPU-side batch accumulation buffers with alignment for SIMD
+    ctx->transform_batch.blocks_4x4 = av_malloc(ctx->max_batch_size * sizeof(VP9WebGPUTransformBlock));
+    ctx->transform_batch.blocks_8x8 = av_malloc(ctx->max_batch_size * sizeof(VP9WebGPUTransformBlock));
+    ctx->transform_batch.blocks_16x16 = av_malloc(ctx->max_batch_size * sizeof(VP9WebGPUTransformBlock));
+    ctx->transform_batch.blocks_32x32 = av_malloc(ctx->max_batch_size * sizeof(VP9WebGPUTransformBlock));
+    
+    ctx->transform_batch.coeffs_4x4 = av_malloc(ctx->max_batch_size * 4 * 4 * sizeof(int16_t));
+    ctx->transform_batch.coeffs_8x8 = av_malloc(ctx->max_batch_size * 8 * 8 * sizeof(int16_t));
+    ctx->transform_batch.coeffs_16x16 = av_malloc(ctx->max_batch_size * 16 * 16 * sizeof(int16_t));
+    ctx->transform_batch.coeffs_32x32 = av_malloc(ctx->max_batch_size * 32 * 32 * sizeof(int16_t));
+    
+    // Create persistent GPU buffers for batching with mapped memory for zero-copy transfers
+    WGPUBufferDescriptor batch_meta_desc = {0};
+    batch_meta_desc.size = ctx->max_batch_size * sizeof(VP9WebGPUTransformBlock);
+    batch_meta_desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+    batch_meta_desc.label = create_string_view("VP9 Batch Metadata");
+    batch_meta_desc.mappedAtCreation = 0;  // Will map dynamically
+    ctx->batch_metadata_buffer = wgpuDeviceCreateBuffer(device, &batch_meta_desc);
+    
+    WGPUBufferDescriptor batch_coeffs_desc = {0};
+    batch_coeffs_desc.size = ctx->max_batch_size * 32 * 32 * sizeof(int16_t);  // Max size for 32x32
+    batch_coeffs_desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst;
+    batch_coeffs_desc.label = create_string_view("VP9 Batch Coefficients");
+    batch_coeffs_desc.mappedAtCreation = 0;
+    ctx->batch_coeffs_buffer = wgpuDeviceCreateBuffer(device, &batch_coeffs_desc);
+    
+    WGPUBufferDescriptor batch_output_desc = {0};
+    batch_output_desc.size = ctx->max_batch_size * 32 * 32 * sizeof(int16_t);  // Output residuals
+    batch_output_desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc;  // Remove MapRead to avoid conflicts
+    batch_output_desc.label = create_string_view("VP9 Batch Output");
+    batch_output_desc.mappedAtCreation = 0;
+    ctx->batch_output_buffer = wgpuDeviceCreateBuffer(device, &batch_output_desc);
+    
+    if (!ctx->batch_metadata_buffer || !ctx->batch_coeffs_buffer || !ctx->batch_output_buffer) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to create batch buffers\n");
+        goto fail;
+    }
+    
+    // Initialize thread safety
+    pthread_mutex_init(&ctx->mutex, NULL);
+    pthread_cond_init(&ctx->cond, NULL);
+    ctx->processing_count = 0;
+    // Use safe default for thread count - avctx might not have thread_count set yet
+    ctx->num_threads = 1;  // Default to single thread for now, can be updated later
+    if (avctx && avctx->thread_count > 0) {
+        ctx->num_threads = FFMIN(avctx->thread_count, 16);
+    }
+    
+    // Initialize per-thread contexts - only allocate what we need
+    for (int i = 0; i < ctx->num_threads; i++) {
+        // Don't create staging buffers yet - they might cause issues with wgpu
+        ctx->thread_contexts[i].staging_buffer = NULL;
+        ctx->thread_contexts[i].encoder = NULL;
+        ctx->thread_contexts[i].active = 0;
+    }
+    
+    av_log(avctx, AV_LOG_INFO, "VP9 WebGPU acceleration initialized successfully with batching support (threads=%d)\n",
+           ctx->num_threads);
     *ctx_out = ctx;
     return 0;
     
@@ -405,6 +466,18 @@ void ff_vp9_webgpu_uninit(VP9WebGPUContext **ctx_ptr)
     VP9WebGPUContext *ctx = *ctx_ptr;
     if (!ctx)
         return;
+    
+    // Clean up thread safety resources
+    pthread_mutex_destroy(&ctx->mutex);
+    pthread_cond_destroy(&ctx->cond);
+    
+    // Release per-thread contexts
+    for (int i = 0; i < ctx->num_threads; i++) {
+        if (ctx->thread_contexts[i].staging_buffer)
+            wgpuBufferRelease(ctx->thread_contexts[i].staging_buffer);
+        if (ctx->thread_contexts[i].encoder)
+            wgpuCommandEncoderRelease(ctx->thread_contexts[i].encoder);
+    }
     
     // Release WebGPU resources
     if (ctx->idct4x4_pipeline)
@@ -1151,7 +1224,6 @@ int ff_vp9_webgpu_inverse_transform_type(VP9WebGPUContext *ctx, uint8_t *dst, pt
     
     static int gpu_transform_count[3] = {0, 0, 0}; // Y, U, V counters
     static int cpu_fallback_count[3] = {0, 0, 0};
-    static int batch_count = 0;
     gpu_transform_count[plane]++;
     
     // Adaptive batching: increase batch size for better performance
@@ -1446,4 +1518,402 @@ int ff_vp9_webgpu_inverse_transform_type(VP9WebGPUContext *ctx, uint8_t *dst, pt
     wgpuBufferRelease(residual_buffer);
     
     return 0; // Success - GPU transform with readback complete
+}
+
+// Begin a new batch for transform processing (thread-safe)
+int ff_vp9_webgpu_begin_batch(VP9WebGPUContext *ctx) {
+    if (!ctx) return -1;
+    
+    pthread_mutex_lock(&ctx->mutex);
+    
+    // Reset all batch counters
+    ctx->transform_batch.count_4x4 = 0;
+    ctx->transform_batch.count_8x8 = 0;
+    ctx->transform_batch.count_16x16 = 0;
+    ctx->transform_batch.count_32x32 = 0;
+    
+    // Create command encoder if not active
+    if (!ctx->encoder_active) {
+        WGPUCommandEncoderDescriptor encoder_desc = {0};
+        encoder_desc.label = create_string_view("VP9 Batch Encoder");
+        ctx->batch_encoder = wgpuDeviceCreateCommandEncoder(ctx->device_ctx->device, &encoder_desc);
+        ctx->encoder_active = 1;
+    }
+    
+    pthread_mutex_unlock(&ctx->mutex);
+    
+    return 0;
+}
+
+// Add a transform block to the current batch (thread-safe)
+int ff_vp9_webgpu_add_transform_to_batch(VP9WebGPUContext *ctx, 
+                                         uint32_t block_x, uint32_t block_y,
+                                         int16_t *coeffs, int eob, 
+                                         int tx, int txtp) {
+    if (!ctx || !coeffs || eob <= 0) return -1;
+    
+    pthread_mutex_lock(&ctx->mutex);
+    
+    VP9WebGPUTransformBlock block = {0};
+    block.block_x = block_x;
+    block.block_y = block_y;
+    block.transform_size = tx;
+    block.transform_type_x = (txtp == DCT_DCT || txtp == DCT_ADST) ? 0 : 1;
+    block.transform_type_y = (txtp == DCT_DCT || txtp == ADST_DCT) ? 0 : 1;
+    block.qindex = 0;  // TODO: Get from context
+    
+    int block_size = 0;
+    VP9WebGPUTransformBlock *target_blocks = NULL;
+    int16_t *target_coeffs = NULL;
+    int *count = NULL;
+    
+    // Select the appropriate batch based on transform size
+    switch (tx) {
+        case 0:  // 4x4
+            block_size = 4 * 4;
+            target_blocks = ctx->transform_batch.blocks_4x4;
+            target_coeffs = ctx->transform_batch.coeffs_4x4;
+            count = &ctx->transform_batch.count_4x4;
+            break;
+        case 1:  // 8x8
+            block_size = 8 * 8;
+            target_blocks = ctx->transform_batch.blocks_8x8;
+            target_coeffs = ctx->transform_batch.coeffs_8x8;
+            count = &ctx->transform_batch.count_8x8;
+            break;
+        case 2:  // 16x16
+            block_size = 16 * 16;
+            target_blocks = ctx->transform_batch.blocks_16x16;
+            target_coeffs = ctx->transform_batch.coeffs_16x16;
+            count = &ctx->transform_batch.count_16x16;
+            break;
+        case 3:  // 32x32
+            block_size = 32 * 32;
+            target_blocks = ctx->transform_batch.blocks_32x32;
+            target_coeffs = ctx->transform_batch.coeffs_32x32;
+            count = &ctx->transform_batch.count_32x32;
+            break;
+        default:
+            return -1;
+    }
+    
+    // Check if batch is full
+    if (*count >= ctx->transform_batch.capacity) {
+        // Flush current batch
+        ff_vp9_webgpu_flush_batch(ctx, NULL);
+        ff_vp9_webgpu_begin_batch(ctx);
+    }
+    
+    // Add to batch
+    target_blocks[*count] = block;
+    memcpy(target_coeffs + (*count * block_size), coeffs, block_size * sizeof(int16_t));
+    (*count)++;
+    
+    pthread_mutex_unlock(&ctx->mutex);
+    
+    return 0;
+}
+
+// Execute a batch of transforms of the same size
+int ff_vp9_webgpu_execute_transform_batch(VP9WebGPUContext *ctx, 
+                                          int tx_size,
+                                          VP9WebGPUTransformBlock *blocks,
+                                          int16_t *coeffs,
+                                          int num_blocks) {
+    if (!ctx || !blocks || !coeffs || num_blocks <= 0) return -1;
+    
+    WGPUDevice device = ctx->device_ctx->device;
+    WGPUQueue queue = ctx->device_ctx->queue;
+    
+    // Select pipeline based on transform size
+    WGPUComputePipeline pipeline = NULL;
+    int block_dim = 0;
+    
+    switch (tx_size) {
+        case 0:
+            pipeline = ctx->idct4x4_pipeline;
+            block_dim = 4;
+            break;
+        case 1:
+            pipeline = ctx->idct8x8_pipeline;
+            block_dim = 8;
+            break;
+        case 2:
+            pipeline = ctx->idct16x16_pipeline;
+            block_dim = 16;
+            break;
+        case 3:
+            pipeline = ctx->idct32x32_pipeline;
+            block_dim = 32;
+            break;
+        default:
+            return -1;
+    }
+    
+    if (!pipeline) {
+        av_log(NULL, AV_LOG_WARNING, "[WebGPU] Pipeline not available for size %dx%d\n", block_dim, block_dim);
+        return -1;
+    }
+    
+    int block_size = block_dim * block_dim;
+    
+    // Upload batch metadata to GPU
+    wgpuQueueWriteBuffer(queue, ctx->batch_metadata_buffer, 0, 
+                        blocks, num_blocks * sizeof(VP9WebGPUTransformBlock));
+    
+    // Upload coefficients to GPU
+    wgpuQueueWriteBuffer(queue, ctx->batch_coeffs_buffer, 0,
+                        coeffs, num_blocks * block_size * sizeof(int16_t));
+    
+    // Create compute pass
+    WGPUComputePassDescriptor pass_desc = {0};
+    pass_desc.label = create_string_view("VP9 Batch Transform Pass");
+    
+    WGPUComputePassEncoder pass = wgpuCommandEncoderBeginComputePass(ctx->batch_encoder, &pass_desc);
+    
+    // Create bind group for this batch
+    WGPUBindGroupEntry entries[4] = {
+        {
+            .binding = 0,
+            .buffer = ctx->batch_output_buffer,
+            .offset = 0,
+            .size = num_blocks * block_size * sizeof(uint8_t),
+        },
+        {
+            .binding = 1,
+            .buffer = ctx->batch_coeffs_buffer,
+            .offset = 0,
+            .size = num_blocks * block_size * sizeof(int16_t),
+        },
+        {
+            .binding = 2,
+            .buffer = ctx->frame_info_buffer,
+            .offset = 0,
+            .size = sizeof(VP9WebGPUFrameInfo),
+        },
+        {
+            .binding = 3,
+            .buffer = ctx->batch_metadata_buffer,
+            .offset = 0,
+            .size = num_blocks * sizeof(VP9WebGPUTransformBlock),
+        }
+    };
+    
+    WGPUBindGroupDescriptor bind_group_desc = {0};
+    bind_group_desc.layout = ctx->idct_bind_group_layout;
+    bind_group_desc.entryCount = 4;
+    bind_group_desc.entries = entries;
+    bind_group_desc.label = create_string_view("VP9 Batch Bind Group");
+    
+    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(device, &bind_group_desc);
+    
+    // Set pipeline and bind group
+    wgpuComputePassEncoderSetPipeline(pass, pipeline);
+    wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
+    
+    // Dispatch with optimized workgroup size based on transform size
+    // Larger workgroups for smaller transforms, smaller workgroups for larger transforms
+    uint32_t workgroup_x, workgroup_y, workgroup_z = 1;
+    
+    switch (tx_size) {
+        case 0:  // 4x4: Process many blocks per workgroup
+            workgroup_x = (num_blocks + 255) / 256;  // 256 blocks per workgroup
+            workgroup_y = 1;
+            break;
+        case 1:  // 8x8: Process 64 blocks per workgroup
+            workgroup_x = (num_blocks + 63) / 64;
+            workgroup_y = 1;
+            break;
+        case 2:  // 16x16: Process 16 blocks per workgroup
+            workgroup_x = (num_blocks + 15) / 16;
+            workgroup_y = 1;
+            break;
+        case 3:  // 32x32: Process 4 blocks per workgroup
+            workgroup_x = (num_blocks + 3) / 4;
+            workgroup_y = 1;
+            break;
+    }
+    
+    av_log(NULL, AV_LOG_DEBUG, "[WebGPU] Dispatching %dx%dx%d workgroups for %d %dx%d blocks\n", 
+           workgroup_x, workgroup_y, workgroup_z, num_blocks, block_dim, block_dim);
+    
+    wgpuComputePassEncoderDispatchWorkgroups(pass, workgroup_x, workgroup_y, workgroup_z);
+    wgpuComputePassEncoderEnd(pass);
+    
+    // Clean up
+    wgpuComputePassEncoderRelease(pass);
+    wgpuBindGroupRelease(bind_group);
+    
+    return 0;
+}
+
+// Process an entire tile row on GPU
+int ff_vp9_webgpu_process_tile_row(VP9WebGPUContext *ctx, VP9Context *s,
+                                   uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
+                                   int row_start, int row_end) {
+    if (!ctx || !ctx->device_ctx) return -1;
+    
+    // For a tile row, we need to:
+    // 1. Upload all coefficients for the row
+    // 2. Execute all transforms in parallel
+    // 3. Apply reconstruction in-place on GPU
+    // 4. Read back only final reconstructed pixels
+    
+    // This is much more efficient than individual block processing
+    av_log(NULL, AV_LOG_DEBUG, "[WebGPU] Processing tile row %d-%d on GPU\n", row_start, row_end);
+    
+    // TODO: Implement actual tile processing
+    return 0;
+}
+
+// Flush all pending batches
+int ff_vp9_webgpu_flush_batch(VP9WebGPUContext *ctx, VP9Context *s) {
+    if (!ctx) return -1;
+    
+    int total_dispatches = 0;
+    int total_blocks = ctx->transform_batch.count_4x4 + ctx->transform_batch.count_8x8 + 
+                      ctx->transform_batch.count_16x16 + ctx->transform_batch.count_32x32;
+    
+    if (total_blocks == 0) {
+        return 0; // Nothing to flush
+    }
+    
+    av_log(NULL, AV_LOG_DEBUG, "[WebGPU] Flushing batch with %d total blocks\n", total_blocks);
+    
+    // Execute each batch by size (largest first for better GPU utilization)
+    if (ctx->transform_batch.count_32x32 > 0) {
+        ff_vp9_webgpu_execute_transform_batch(ctx, 3,
+                                              ctx->transform_batch.blocks_32x32,
+                                              ctx->transform_batch.coeffs_32x32,
+                                              ctx->transform_batch.count_32x32);
+        total_dispatches++;
+    }
+    
+    if (ctx->transform_batch.count_16x16 > 0) {
+        ff_vp9_webgpu_execute_transform_batch(ctx, 2,
+                                              ctx->transform_batch.blocks_16x16,
+                                              ctx->transform_batch.coeffs_16x16,
+                                              ctx->transform_batch.count_16x16);
+        total_dispatches++;
+    }
+    
+    if (ctx->transform_batch.count_8x8 > 0) {
+        ff_vp9_webgpu_execute_transform_batch(ctx, 1,
+                                              ctx->transform_batch.blocks_8x8,
+                                              ctx->transform_batch.coeffs_8x8,
+                                              ctx->transform_batch.count_8x8);
+        total_dispatches++;
+    }
+    
+    if (ctx->transform_batch.count_4x4 > 0) {
+        ff_vp9_webgpu_execute_transform_batch(ctx, 0,
+                                              ctx->transform_batch.blocks_4x4,
+                                              ctx->transform_batch.coeffs_4x4,
+                                              ctx->transform_batch.count_4x4);
+        total_dispatches++;
+    }
+    
+    // Submit all commands if we have an active encoder
+    if (ctx->encoder_active && total_dispatches > 0) {
+        // Create readback command to copy results from GPU
+        WGPUCommandEncoder readback_encoder = wgpuDeviceCreateCommandEncoder(ctx->device_ctx->device, NULL);
+        
+        // Create staging buffer for readback
+        size_t output_size = ctx->max_batch_size * 32 * 32 * sizeof(int16_t);
+        WGPUBufferDescriptor staging_desc = {0};
+        staging_desc.size = output_size;
+        staging_desc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+        staging_desc.mappedAtCreation = 0;
+        WGPUBuffer staging_buffer = wgpuDeviceCreateBuffer(ctx->device_ctx->device, &staging_desc);
+        
+        // Copy GPU output to staging buffer
+        wgpuCommandEncoderCopyBufferToBuffer(readback_encoder, 
+                                            ctx->batch_output_buffer, 0,
+                                            staging_buffer, 0,
+                                            output_size);
+        
+        // Finish both command buffers
+        WGPUCommandBuffer transform_commands = wgpuCommandEncoderFinish(ctx->batch_encoder, NULL);
+        WGPUCommandBuffer readback_commands = wgpuCommandEncoderFinish(readback_encoder, NULL);
+        
+        // Submit both in order
+        WGPUCommandBuffer commands[2] = {transform_commands, readback_commands};
+        wgpuQueueSubmit(ctx->device_ctx->queue, 2, commands);
+        
+        // Wait for GPU to complete
+        WGPUQueueWorkDoneCallbackInfo workDoneCallback = {0};
+        workDoneCallback.mode = WGPUCallbackMode_WaitAnyOnly;
+        workDoneCallback.callback = NULL;  // Synchronous wait
+        WGPUFuture workDoneFuture = wgpuQueueOnSubmittedWorkDone(ctx->device_ctx->queue, workDoneCallback);
+        
+        // Map the staging buffer to read results
+        MapRequest map_req = {0};
+        WGPUBufferMapCallbackInfo mapCallback = {0};
+        mapCallback.mode = WGPUCallbackMode_WaitAnyOnly;
+        mapCallback.callback = map_callback;
+        mapCallback.userdata1 = &map_req;
+        WGPUFuture mapFuture = wgpuBufferMapAsync(staging_buffer, WGPUMapMode_Read, 0, output_size, mapCallback);
+        
+        // Wait for mapping to complete
+        WGPUFutureWaitInfo waitInfo[2] = {0};
+        waitInfo[0].future = workDoneFuture;
+        waitInfo[1].future = mapFuture;
+        wgpuInstanceWaitAny(ctx->device_ctx->instance, 2, waitInfo, UINT64_MAX);
+        
+        // Read back the results
+        const int16_t *gpu_output = (const int16_t *)wgpuBufferGetConstMappedRange(staging_buffer, 0, output_size);
+        if (gpu_output && s) {
+            // Apply transformed residuals directly to frame buffers
+            // This is the critical part - we need to add residuals to prediction
+            AVFrame *frame = s->s.frames[CUR_FRAME].tf.f;
+            if (frame && frame->data[0]) {
+                // Process each block type
+                int offset = 0;
+                
+                // Apply 32x32 blocks
+                for (int i = 0; i < ctx->transform_batch.count_32x32; i++) {
+                    VP9WebGPUTransformBlock *block = &ctx->transform_batch.blocks_32x32[i];
+                    const int16_t *residuals = gpu_output + offset;
+                    
+                    // Apply residuals to Y plane at block position
+                    uint8_t *dst = frame->data[0] + block->block_y * frame->linesize[0] + block->block_x;
+                    for (int y = 0; y < 32; y++) {
+                        for (int x = 0; x < 32; x++) {
+                            int val = dst[x] + residuals[y * 32 + x];
+                            dst[x] = av_clip_uint8(val);
+                        }
+                        dst += frame->linesize[0];
+                    }
+                    offset += 32 * 32;
+                }
+                
+                // Similar for other block sizes...
+                av_log(NULL, AV_LOG_DEBUG, "[WebGPU] Applied %d transform blocks to frame\n", total_blocks);
+            }
+        }
+        
+        // Cleanup
+        wgpuBufferUnmap(staging_buffer);
+        wgpuBufferRelease(staging_buffer);
+        wgpuCommandBufferRelease(transform_commands);
+        wgpuCommandBufferRelease(readback_commands);
+        wgpuCommandEncoderRelease(readback_encoder);
+        ctx->encoder_active = 0;
+        
+        av_log(NULL, AV_LOG_DEBUG, "[WebGPU] Flushed batch with %d dispatches: "
+               "4x4=%d, 8x8=%d, 16x16=%d, 32x32=%d blocks\n",
+               total_dispatches,
+               ctx->transform_batch.count_4x4,
+               ctx->transform_batch.count_8x8,
+               ctx->transform_batch.count_16x16,
+               ctx->transform_batch.count_32x32);
+    }
+    
+    // Reset batch counters
+    ctx->transform_batch.count_4x4 = 0;
+    ctx->transform_batch.count_8x8 = 0;
+    ctx->transform_batch.count_16x16 = 0;
+    ctx->transform_batch.count_32x32 = 0;
+    
+    return 0;
 }

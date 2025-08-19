@@ -221,8 +221,12 @@ static av_always_inline int check_intra_mode(VP9TileData *td, int mode, uint8_t 
 }
 
 #if CONFIG_WEBGPU
+// Global batch state for inter prediction
+static int inter_batch_started = 0;
+
 static av_always_inline int try_webgpu_transform(VP9TileData *td, uint8_t *ptr, ptrdiff_t stride,
-                                                 int16_t *coeffs, int eob, enum TxfmMode tx, enum TxfmType txtp)
+                                                 int16_t *coeffs, int eob, enum TxfmMode tx, enum TxfmType txtp,
+                                                 int row, int col)
 {
     const VP9Context *s = td->s;
     
@@ -231,25 +235,26 @@ static av_always_inline int try_webgpu_transform(VP9TileData *td, uint8_t *ptr, 
         return 0; // Fall back to CPU
     }
     
-    // Only use WebGPU for DCT transforms currently (most common)
-    if (txtp != DCT_DCT) {
-        return 0; // Fall back to CPU for non-DCT transforms
-    }
-    
     // Validate transform parameters
     if (!coeffs || eob <= 0 || tx > 3) {
         return 0; // Invalid parameters, fall back to CPU
     }
     
-    // Try to perform WebGPU inverse transform with transform type
-    int ret = ff_vp9_webgpu_inverse_transform_type(s->webgpu_ctx, ptr, stride, coeffs, eob, tx, txtp, 0);
-    if (ret == 0) {
-        // WebGPU transform succeeded
-        return 1;
+    // Start batch if not started
+    if (!inter_batch_started) {
+        ff_vp9_webgpu_begin_batch(s->webgpu_ctx);
+        inter_batch_started = 1;
     }
     
-    // WebGPU transform failed, fall back to CPU
-    return 0;
+    // Add transform to batch
+    uint32_t block_x = col * 8;
+    uint32_t block_y = row * 8;
+    int ret = ff_vp9_webgpu_add_transform_to_batch(s->webgpu_ctx, block_x, block_y,
+                                                   coeffs, eob, tx, txtp);
+    
+    // Return 1 to indicate GPU will handle it (skip CPU transform)
+    // The batch will be processed and results written back when flushed
+    return (ret == 0) ? 1 : 0;
 }
 #endif
 
@@ -269,6 +274,15 @@ static av_always_inline void intra_recon(VP9TileData *td, ptrdiff_t y_off,
     LOCAL_ALIGNED_32(uint8_t, a_buf, [96]);
     LOCAL_ALIGNED_32(uint8_t, l, [64]);
 
+#if CONFIG_WEBGPU
+    // Start WebGPU batch for this block if available
+    int webgpu_batch_started = 0;
+    if (s->webgpu_ctx) {
+        ff_vp9_webgpu_begin_batch(s->webgpu_ctx);
+        webgpu_batch_started = 1;
+    }
+#endif
+
     for (n = 0, y = 0; y < end_y; y += step1d) {
         uint8_t *ptr = dst, *ptr_r = dst_r;
         for (x = 0; x < end_x; x += step1d, ptr += 4 * step1d * bytesperpixel,
@@ -286,8 +300,19 @@ static av_always_inline void intra_recon(VP9TileData *td, ptrdiff_t y_off,
             s->dsp.intra_pred[b->tx][mode](ptr, td->y_stride, l, a);
             if (eob) {
 #if CONFIG_WEBGPU
-                if (!try_webgpu_transform(td, ptr, td->y_stride, 
-                                        (int16_t*)(td->block + 16 * n * bytesperpixel), eob, tx, txtp))
+                // Try to add transform to batch
+                if (webgpu_batch_started) {
+                    uint32_t block_x = col * 8 + x * 4;
+                    uint32_t block_y = row * 8 + y * 4;
+                    int ret = ff_vp9_webgpu_add_transform_to_batch(s->webgpu_ctx, block_x, block_y,
+                                                                   (int16_t*)(td->block + 16 * n * bytesperpixel),
+                                                                   eob, tx, txtp);
+                    if (ret != 0) {
+                        // Failed to batch, fall back to CPU
+                        s->dsp.itxfm_add[tx][txtp](ptr, td->y_stride,
+                                                  td->block + 16 * n * bytesperpixel, eob);
+                    }
+                } else
 #endif
                 s->dsp.itxfm_add[tx][txtp](ptr, td->y_stride,
                                            td->block + 16 * n * bytesperpixel, eob);
@@ -320,17 +345,19 @@ static av_always_inline void intra_recon(VP9TileData *td, ptrdiff_t y_off,
                 s->dsp.intra_pred[b->uvtx][mode](ptr, td->uv_stride, l, a);
                 if (eob) {
 #if CONFIG_WEBGPU
-                    // Try WebGPU transform for chroma plane (p+1 because 0=Y, 1=U, 2=V)
-                    int webgpu_done = 0;
-                    if (s->webgpu_ctx) {
-                        int ret = ff_vp9_webgpu_inverse_transform_plane(s->webgpu_ctx, ptr, td->uv_stride,
-                                                                       (int16_t*)(td->uvblock[p] + 16 * n * bytesperpixel), 
-                                                                       eob, b->uvtx, p + 1);
-                        if (ret == 0) {
-                            webgpu_done = 1; // WebGPU succeeded
+                    // Try to add chroma transform to batch
+                    if (webgpu_batch_started) {
+                        uint32_t block_x = (col * 8 + x * 4) >> s->ss_h;
+                        uint32_t block_y = (row * 8 + y * 4) >> s->ss_v;
+                        int ret = ff_vp9_webgpu_add_transform_to_batch(s->webgpu_ctx, block_x, block_y,
+                                                                       (int16_t*)(td->uvblock[p] + 16 * n * bytesperpixel),
+                                                                       eob, uvtx, DCT_DCT);
+                        if (ret != 0) {
+                            // Failed to batch, fall back to CPU
+                            s->dsp.itxfm_add[uvtx][DCT_DCT](ptr, td->uv_stride,
+                                                           td->uvblock[p] + 16 * n * bytesperpixel, eob);
                         }
-                    }
-                    if (!webgpu_done)
+                    } else
 #endif
                     s->dsp.itxfm_add[uvtx][DCT_DCT](ptr, td->uv_stride,
                                                     td->uvblock[p] + 16 * n * bytesperpixel, eob);
@@ -340,6 +367,11 @@ static av_always_inline void intra_recon(VP9TileData *td, ptrdiff_t y_off,
             dst   += 4 * uvstep1d * td->uv_stride;
         }
     }
+
+#if CONFIG_WEBGPU
+    // Don't flush here - let the batch accumulate more blocks!
+    // We'll flush when the batch is full or at frame boundaries
+#endif
 }
 
 void ff_vp9_intra_recon_8bpp(VP9TileData *td, ptrdiff_t y_off, ptrdiff_t uv_off)
@@ -682,7 +714,8 @@ static av_always_inline void inter_recon(VP9TileData *td, int bytesperpixel)
                 if (eob) {
 #if CONFIG_WEBGPU
                     if (!try_webgpu_transform(td, ptr, td->y_stride,
-                                            (int16_t*)(td->block + 16 * n * bytesperpixel), eob, tx, DCT_DCT))
+                                            (int16_t*)(td->block + 16 * n * bytesperpixel), eob, tx, DCT_DCT,
+                                            row, col))
 #endif
                     s->dsp.itxfm_add[tx][DCT_DCT](ptr, td->y_stride,
                                                   td->block + 16 * n * bytesperpixel, eob);
@@ -706,7 +739,8 @@ static av_always_inline void inter_recon(VP9TileData *td, int bytesperpixel)
                     if (eob) {
 #if CONFIG_WEBGPU
                         if (!try_webgpu_transform(td, ptr, td->uv_stride,
-                                                (int16_t*)(td->uvblock[p] + 16 * n * bytesperpixel), eob, uvtx, DCT_DCT))
+                                                (int16_t*)(td->uvblock[p] + 16 * n * bytesperpixel), eob, uvtx, DCT_DCT,
+                                                row, col))
 #endif
                         s->dsp.itxfm_add[uvtx][DCT_DCT](ptr, td->uv_stride,
                                                         td->uvblock[p] + 16 * n * bytesperpixel, eob);

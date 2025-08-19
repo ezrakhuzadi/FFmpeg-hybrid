@@ -24,6 +24,7 @@
 #define AVCODEC_VP9_WEBGPU_H
 
 #include <webgpu.h>
+#include <pthread.h>
 
 #include "libavutil/buffer.h"
 #include "libavutil/hwcontext.h"
@@ -33,6 +34,15 @@
 
 // Forward declarations
 typedef struct VP9Context VP9Context;
+
+// Transform block metadata (matches WGSL struct)
+typedef struct VP9WebGPUTransformBlock {
+    uint32_t block_x, block_y;
+    uint32_t transform_size;
+    uint32_t transform_type_x, transform_type_y;
+    uint32_t qindex;
+    uint32_t _pad[2];
+} VP9WebGPUTransformBlock;
 
 typedef struct VP9WebGPUContext {
     AVBufferRef *device_ref;
@@ -102,16 +112,51 @@ typedef struct VP9WebGPUContext {
     // Batching for reduced overhead
     int batch_size;            // Number of blocks to process per dispatch
     int max_batch_size;        // Maximum batch size (tunable)
+    
+    // Batch accumulation buffers
+    struct {
+        VP9WebGPUTransformBlock *blocks_4x4;
+        VP9WebGPUTransformBlock *blocks_8x8;
+        VP9WebGPUTransformBlock *blocks_16x16;
+        VP9WebGPUTransformBlock *blocks_32x32;
+        int16_t *coeffs_4x4;
+        int16_t *coeffs_8x8;
+        int16_t *coeffs_16x16;
+        int16_t *coeffs_32x32;
+        // Store destination pointers and strides for writeback
+        struct {
+            uint8_t *dst;
+            ptrdiff_t stride;
+        } *dests_4x4, *dests_8x8, *dests_16x16, *dests_32x32;
+        int count_4x4;
+        int count_8x8;
+        int count_16x16;
+        int count_32x32;
+        int capacity;  // Max blocks per batch
+    } transform_batch;
+    
+    // Persistent GPU buffers for batching
+    WGPUBuffer batch_metadata_buffer;
+    WGPUBuffer batch_coeffs_buffer;
+    WGPUBuffer batch_output_buffer;
+    
+    // Command encoder for batching
+    WGPUCommandEncoder batch_encoder;
+    int encoder_active;
+    
+    // Thread safety
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    int processing_count;  // Number of threads currently processing
+    
+    // Per-thread contexts for multi-threading
+    struct {
+        WGPUCommandEncoder encoder;
+        WGPUBuffer staging_buffer;
+        int active;
+    } thread_contexts[16];  // Support up to 16 threads
+    int num_threads;
 } VP9WebGPUContext;
-
-// Transform block metadata (matches WGSL struct)
-typedef struct VP9WebGPUTransformBlock {
-    uint32_t block_x, block_y;
-    uint32_t transform_size;
-    uint32_t transform_type_x, transform_type_y;
-    uint32_t qindex;
-    uint32_t _pad[2];
-} VP9WebGPUTransformBlock;
 
 // Motion compensation block metadata
 typedef struct VP9WebGPUMCBlock {
@@ -186,5 +231,25 @@ int ff_vp9_webgpu_inverse_transform_plane(VP9WebGPUContext *ctx, uint8_t *dst, p
 // Full transform with type support (DCT_DCT, DCT_ADST, ADST_DCT, ADST_ADST)
 int ff_vp9_webgpu_inverse_transform_type(VP9WebGPUContext *ctx, uint8_t *dst, ptrdiff_t stride,
                                          int16_t *coeffs, int eob, int tx, int txtp, int plane);
+
+// Batched transform operations
+int ff_vp9_webgpu_begin_batch(VP9WebGPUContext *ctx);
+int ff_vp9_webgpu_add_transform_to_batch(VP9WebGPUContext *ctx, 
+                                         uint32_t block_x, uint32_t block_y,
+                                         int16_t *coeffs, int eob, 
+                                         int tx, int txtp);
+int ff_vp9_webgpu_flush_batch(VP9WebGPUContext *ctx, VP9Context *s);
+
+// Execute batched transforms by size
+int ff_vp9_webgpu_execute_transform_batch(VP9WebGPUContext *ctx, 
+                                          int tx_size,
+                                          VP9WebGPUTransformBlock *blocks,
+                                          int16_t *coeffs,
+                                          int num_blocks);
+
+// Process entire tile row on GPU
+int ff_vp9_webgpu_process_tile_row(VP9WebGPUContext *ctx, VP9Context *s,
+                                   uint8_t *dst_y, uint8_t *dst_u, uint8_t *dst_v,
+                                   int row_start, int row_end);
 
 #endif /* AVCODEC_VP9_WEBGPU_H */
