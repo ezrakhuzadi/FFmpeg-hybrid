@@ -249,7 +249,21 @@ static av_always_inline void intra_recon(VP9TileData *td, ptrdiff_t y_off,
     LOCAL_ALIGNED_32(uint8_t, l, [64]);
 
 #if CONFIG_WEBGPU
-    // Batch should be started at frame level
+    // Accumulate intra blocks too
+    if (s->webgpu_ctx) {
+        int sb_x = (col / 8) * 64;
+        int sb_y = (row / 8) * 64;
+        
+        static int intra_count = 0;
+        intra_count++;
+        if (intra_count % 1000 == 1) {
+            av_log(NULL, AV_LOG_INFO, "[WebGPU] Intra blocks processed: %d\n", intra_count);
+        }
+        
+        // Accumulate intra block data for GPU processing
+        ff_vp9_webgpu_accumulate_intra_data(s->webgpu_ctx, sb_x, sb_y, 
+                                           b->mode[0], b->bs);
+    }
 #endif
 
     for (n = 0, y = 0; y < end_y; y += step1d) {
@@ -266,7 +280,14 @@ static av_always_inline void intra_recon(VP9TileData *td, ptrdiff_t y_off,
                                     s->s.frames[CUR_FRAME].tf.f->linesize[0],
                                     ptr, td->y_stride, l,
                                     col, x, w4, row, y, b->tx, 0, 0, 0, bytesperpixel);
-            s->dsp.intra_pred[b->tx][mode](ptr, td->y_stride, l, a);
+            // Skip CPU prediction if using GPU
+#if CONFIG_WEBGPU
+            if (!s->webgpu_ctx) {
+#endif
+                s->dsp.intra_pred[b->tx][mode](ptr, td->y_stride, l, a);
+#if CONFIG_WEBGPU
+            }
+#endif
             if (eob) {
 #if CONFIG_WEBGPU
                 // Accumulate coefficients at superblock level (DO NOT fall back to CPU!)
@@ -279,9 +300,14 @@ static av_always_inline void intra_recon(VP9TileData *td, ptrdiff_t y_off,
                                                           td->block + 16 * n * bytesperpixel,
                                                           block_size, b->tx, 0);
                 }
+                // Skip CPU IDCT if using GPU
+                if (!s->webgpu_ctx) {
 #endif
-                s->dsp.itxfm_add[tx][txtp](ptr, td->y_stride,
-                                           td->block + 16 * n * bytesperpixel, eob);
+                    s->dsp.itxfm_add[tx][txtp](ptr, td->y_stride,
+                                               td->block + 16 * n * bytesperpixel, eob);
+#if CONFIG_WEBGPU
+                }
+#endif
             }
         }
         dst_r += 4 * step1d * s->s.frames[CUR_FRAME].tf.f->linesize[0];
@@ -655,6 +681,28 @@ static av_always_inline void inter_recon(VP9TileData *td, int bytesperpixel)
             inter_pred_16bpp(td);
         }
     }
+    
+#if CONFIG_WEBGPU
+    // Accumulate motion compensation data for ALL inter blocks (not just those with coefficients!)
+    if (s->webgpu_ctx) {
+        // Get superblock coordinates (col/row are in 8x8 blocks, SB is 64x64 pixels = 8x8 blocks)
+        int sb_x = (col / 8) * 64;  // Superblock column * 64 pixels
+        int sb_y = (row / 8) * 64;  // Superblock row * 64 pixels
+        
+        static int log_count = 0;
+        log_count++;
+        // Log every 1000th block to avoid spam
+        if (log_count % 1000 == 1) {
+            av_log(NULL, AV_LOG_INFO, "[WebGPU] Inter blocks processed: %d\n", log_count);
+        }
+        
+        // Store motion vectors and reference frame info for this block
+        ff_vp9_webgpu_accumulate_motion_data(s->webgpu_ctx, sb_x, sb_y,
+                                            &b->mv[0][0], &b->mv[0][1], 
+                                            b->ref[0], b->ref[1],
+                                            b->comp, b->mode[0], b->bs);
+    }
+#endif
 
     if (!b->skip) {
         /* mostly copied intra_recon() */

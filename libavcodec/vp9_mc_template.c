@@ -53,10 +53,10 @@ static void FN(inter_pred)(VP9TileData *td)
         mc_block.ss_x = s->ss_h;
         mc_block.ss_y = s->ss_v;
         
-        // Try WebGPU motion compensation
-        int ret = ff_vp9_webgpu_motion_compensation(s->webgpu_ctx, (VP9Context *)s, &mc_block, 1);
+        // Add to batch for later GPU execution
+        int ret = ff_vp9_webgpu_add_mc_block(s->webgpu_ctx, &mc_block);
         if (ret == 0) {
-            return; // WebGPU motion compensation succeeded
+            return; // Block added to batch, will be processed later
         }
         // Fall through to CPU implementation on failure
     }

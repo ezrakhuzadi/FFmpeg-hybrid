@@ -32,6 +32,7 @@
 #include "libavutil/hwcontext_webgpu.h"
 
 #include "avcodec.h"
+#include "vp9shared.h"
 
 // Forward declarations
 typedef struct VP9Context VP9Context;
@@ -322,6 +323,13 @@ typedef struct VP9WebGPUContext {
     WGPUBuffer sb_coeff_buffer;
     WGPUBuffer frame_buffer;
     WGPUBuffer prediction_buffer;
+    
+    // Motion compensation batching
+    struct {
+        struct VP9WebGPUMCBlock *blocks;
+        int count;
+        int capacity;
+    } mc_batch;
 } VP9WebGPUContext;
 
 // Motion compensation block metadata
@@ -377,6 +385,12 @@ int ff_vp9_webgpu_transform(VP9WebGPUContext *ctx, VP9Context *s,
 int ff_vp9_webgpu_motion_compensation(VP9WebGPUContext *ctx, VP9Context *s,
                                      const VP9WebGPUMCBlock *block_info,
                                      int num_blocks);
+
+// Add MC block to batch for later execution
+int ff_vp9_webgpu_add_mc_block(VP9WebGPUContext *ctx, const VP9WebGPUMCBlock *block);
+
+// Execute all batched MC blocks
+int ff_vp9_webgpu_flush_mc_batch(VP9WebGPUContext *ctx, VP9Context *s);
 
 // Execute loop filtering on WebGPU
 int ff_vp9_webgpu_loop_filter(VP9WebGPUContext *ctx, VP9Context *s,
@@ -446,6 +460,18 @@ void ff_vp9_webgpu_accumulate_block_coeffs(VP9WebGPUContext *ctx,
                                            int block_x, int block_y,
                                            int16_t *coeffs, int size,
                                            int tx, int plane);
+
+// Accumulate motion compensation data for inter blocks
+void ff_vp9_webgpu_accumulate_motion_data(VP9WebGPUContext *ctx,
+                                          int sb_x, int sb_y,
+                                          const VP9mv *mv0, const VP9mv *mv1,
+                                          int ref0, int ref1,
+                                          int comp, int mode, int bs);
+
+// Accumulate intra prediction data
+void ff_vp9_webgpu_accumulate_intra_data(VP9WebGPUContext *ctx,
+                                         int sb_x, int sb_y,
+                                         int mode, int bs);
 
 // Begin frame decode with mapped GPU buffer for zero-copy
 int ff_vp9_webgpu_begin_frame(VP9WebGPUContext *ctx);

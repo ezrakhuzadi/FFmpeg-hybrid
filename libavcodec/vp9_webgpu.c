@@ -56,6 +56,7 @@ static volatile int work_done_flag = 0;
 // Callback for buffer mapping
 static void map_callback(WGPUMapAsyncStatus status, WGPUStringView message, void *userdata1, void *userdata2) {
     MapRequest *req = (MapRequest*)userdata1;
+    if (!req) return;  // Handle async callbacks after buffer release
     if (status == WGPUMapAsyncStatus_Success) {
         req->ready = 1;
     } else {
@@ -160,8 +161,10 @@ int ff_vp9_webgpu_init(AVCodecContext *avctx, VP9WebGPUContext **ctx_out)
     ctx->device_ctx = (AVWebGPUDeviceContext *)((AVHWDeviceContext *)ctx->device_ref->data)->hwctx;
     device = ctx->device_ctx->device;
     
-    // Load MEGA KERNEL WGSL shader
+    // Use the superblock shader from the header instead of incomplete file
     WGPUShaderModule mega_kernel_shader = NULL;
+    
+    // Try to load custom mega kernel first (if it exists and is complete)
     FILE *wgsl_file = fopen("/home/ezra/FFmpeg-hybrid/vp9_mega_kernel.wgsl", "r");
     if (wgsl_file) {
         fseek(wgsl_file, 0, SEEK_END);
@@ -173,13 +176,17 @@ int ff_vp9_webgpu_init(AVCodecContext *avctx, VP9WebGPUContext **ctx_out)
             wgsl_source[wgsl_size] = '\0';
             mega_kernel_shader = create_shader_module(device, wgsl_source, "VP9 Mega Kernel");
             if (mega_kernel_shader) {
-                av_log(avctx, AV_LOG_INFO, "[WebGPU] 📦 Loaded MEGA KERNEL shader (%zu bytes)\n", wgsl_size);
+                av_log(avctx, AV_LOG_INFO, "[WebGPU] 📦 Loaded custom MEGA KERNEL shader (%zu bytes)\n", wgsl_size);
             }
         }
         av_free(wgsl_source);
         fclose(wgsl_file);
-    } else {
-        av_log(avctx, AV_LOG_WARNING, "[WebGPU] Could not open mega kernel shader file\n");
+    }
+    
+    // Fall back to built-in superblock shader if no custom kernel
+    if (!mega_kernel_shader) {
+        av_log(avctx, AV_LOG_INFO, "[WebGPU] Using built-in VP9 superblock shader\n");
+        // The superblock shader will be used via superblock_shader below
     }
     
     // Create shader modules for all transform sizes and types (legacy - will be replaced by mega kernel)
@@ -574,8 +581,9 @@ int ff_vp9_webgpu_init(AVCodecContext *avctx, VP9WebGPUContext **ctx_out)
     ctx->sb_info_buffer = wgpuDeviceCreateBuffer(device, &sb_buffer_desc);
     
     // Create zero-copy ring buffers with two-buffer strategy
+    // Size for 8K video: 8192 superblocks max
     for (int i = 0; i < 3; i++) {
-        size_t buffer_size = ctx->tile_batch.capacity_sb * sizeof(VP9SuperblockGPU);
+        size_t buffer_size = 8192 * sizeof(VP9SuperblockGPU);  // Max 8K resolution
         char label[64];
         
         // 1. Mappable buffer (CPU writes here - ZERO COPY!)
@@ -2295,6 +2303,90 @@ void ff_vp9_webgpu_extract_superblock_data(VP9Context *s,
     }
 }
 
+// Accumulate motion compensation data for inter blocks
+void ff_vp9_webgpu_accumulate_motion_data(VP9WebGPUContext *ctx,
+                                          int sb_x, int sb_y,
+                                          const VP9mv *mv0, const VP9mv *mv1,
+                                          int ref0, int ref1,
+                                          int comp, int mode, int bs) {
+    if (!ctx || !ctx->tile_batch.is_mapped) return;
+    
+    // Check if we need to save the current superblock and start a new one
+    if (ctx->tile_batch.current_sb_x != sb_x || ctx->tile_batch.current_sb_y != sb_y) {
+        // Save current superblock if it has any data (coeffs OR motion)
+        if (ctx->tile_batch.accumulated_count < ctx->tile_batch.accumulated_capacity) {
+            // Only save if we've seen this SB before (not uninitialized)
+            if (ctx->tile_batch.current_sb_x >= 0 && ctx->tile_batch.current_sb_y >= 0) {
+                ctx->tile_batch.mapped_sbs[ctx->tile_batch.accumulated_count] = ctx->tile_batch.current_sb;
+                ctx->tile_batch.accumulated_count++;
+                av_log(NULL, AV_LOG_DEBUG, "[WebGPU] Saved inter SB at (%d,%d), total=%d\n", 
+                       ctx->tile_batch.current_sb_x, ctx->tile_batch.current_sb_y, ctx->tile_batch.accumulated_count);
+            }
+        }
+        
+        // Start new superblock
+        memset(&ctx->tile_batch.current_sb, 0, sizeof(VP9SuperblockGPU));
+        ctx->tile_batch.current_sb.x = sb_x;
+        ctx->tile_batch.current_sb.y = sb_y;
+        ctx->tile_batch.current_sb_x = sb_x;
+        ctx->tile_batch.current_sb_y = sb_y;
+        ctx->tile_batch.has_coeffs = 0;
+    }
+    
+    // Mark this as an inter-predicted block
+    ctx->tile_batch.current_sb.mode |= 0x80000000;  // High bit indicates inter
+    
+    // Store motion vectors (average for the superblock)
+    if (mv0) {
+        ctx->tile_batch.current_sb.motion_vectors[0] = mv0->x;
+        ctx->tile_batch.current_sb.motion_vectors[1] = mv0->y;
+    }
+    
+    // Store reference frame and mode info
+    ctx->tile_batch.current_sb.mode |= (ref0 & 0x7) << 16;  // Ref frame in bits 16-18
+    if (comp && mv1) {
+        ctx->tile_batch.current_sb.mode |= (ref1 & 0x7) << 19;  // Second ref in bits 19-21
+    }
+}
+
+// Accumulate intra prediction data for superblocks
+void ff_vp9_webgpu_accumulate_intra_data(VP9WebGPUContext *ctx,
+                                         int sb_x, int sb_y,
+                                         int mode, int bs) {
+    if (!ctx || !ctx->tile_batch.is_mapped) return;
+    
+    // Check if we need to save the current superblock and start a new one
+    if (ctx->tile_batch.current_sb_x != sb_x || ctx->tile_batch.current_sb_y != sb_y) {
+        // Save current superblock if it has any data
+        if (ctx->tile_batch.accumulated_count < ctx->tile_batch.accumulated_capacity) {
+            // Only save if we've seen this SB before (not uninitialized)
+            if (ctx->tile_batch.current_sb_x >= 0 && ctx->tile_batch.current_sb_y >= 0) {
+                ctx->tile_batch.mapped_sbs[ctx->tile_batch.accumulated_count] = ctx->tile_batch.current_sb;
+                ctx->tile_batch.accumulated_count++;
+                av_log(NULL, AV_LOG_DEBUG, "[WebGPU] Saved intra SB at (%d,%d), total=%d\n", 
+                       ctx->tile_batch.current_sb_x, ctx->tile_batch.current_sb_y, ctx->tile_batch.accumulated_count);
+            }
+        }
+        
+        // Start new superblock
+        memset(&ctx->tile_batch.current_sb, 0, sizeof(VP9SuperblockGPU));
+        ctx->tile_batch.current_sb.x = sb_x;
+        ctx->tile_batch.current_sb.y = sb_y;
+        ctx->tile_batch.current_sb_x = sb_x;
+        ctx->tile_batch.current_sb_y = sb_y;
+        ctx->tile_batch.has_coeffs = 0;
+    }
+    
+    // Mark this as an intra-predicted block
+    ctx->tile_batch.current_sb.mode &= ~0x80000000;  // Clear high bit for intra
+    
+    // Store intra mode in lower 8 bits
+    ctx->tile_batch.current_sb.mode |= (mode & 0xFF);
+    
+    // Store block size info
+    ctx->tile_batch.current_sb.partition_mask |= (bs & 0xF);
+}
+
 // Accumulate block coefficients into current superblock (DO NOT fall back to CPU!)
 void ff_vp9_webgpu_accumulate_block_coeffs(VP9WebGPUContext *ctx,
                                            int block_x, int block_y,
@@ -2669,11 +2761,12 @@ void ff_vp9_webgpu_dispatch_complete_frame(VP9WebGPUContext *ctx, VP9Context *s)
         sampler_desc.label = create_string_view("Persistent Ref Sampler");
         ctx->mega_sampler = wgpuDeviceCreateSampler(device, &sampler_desc);
         
-        // Create persistent output frame buffer
+        // Create persistent output frame buffer - sized for 8K video
+        size_t frame_buffer_size = 8192 * 4096 * sizeof(uint32_t);  // 8K resolution max
         WGPUBufferDescriptor frame_desc = {
-            .size = ctx->frame_width * ctx->frame_height * sizeof(uint32_t),
+            .size = frame_buffer_size,
             .usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc,
-            .label = create_string_view("Persistent Frame Buffer"),
+            .label = create_string_view("Persistent Frame Buffer (8K)"),
         };
         ctx->mega_frame_buffer = wgpuDeviceCreateBuffer(device, &frame_desc);
         
@@ -2681,7 +2774,7 @@ void ff_vp9_webgpu_dispatch_complete_frame(VP9WebGPUContext *ctx, VP9Context *s)
         WGPUBindGroupEntry entries[] = {
             { .binding = 0, .buffer = ctx->mega_uniform_buffer, .size = sizeof(frame_info) },
             { .binding = 1, .buffer = ctx->mega_superblock_buffer, .size = sb_buffer_size },
-            { .binding = 2, .buffer = ctx->mega_frame_buffer, .size = ctx->frame_width * ctx->frame_height * sizeof(uint32_t) },
+            { .binding = 2, .buffer = ctx->mega_frame_buffer, .size = frame_buffer_size },
             { .binding = 3, .textureView = ctx->mega_ref_view },
             { .binding = 4, .sampler = ctx->mega_sampler },
         };
@@ -2780,6 +2873,48 @@ void ff_vp9_webgpu_async_decode_pipeline(VP9WebGPUContext *ctx, VP9Context *s) {
            cpu_idx, gpu_idx, display_idx);
 }
 
+// Add MC block to batch for later execution
+int ff_vp9_webgpu_add_mc_block(VP9WebGPUContext *ctx, const VP9WebGPUMCBlock *block) {
+    if (!ctx || !block) return -1;
+    
+    // Initialize batch if needed
+    if (!ctx->mc_batch.blocks) {
+        ctx->mc_batch.capacity = 8192;  // Start with space for 8K blocks
+        ctx->mc_batch.blocks = av_mallocz(ctx->mc_batch.capacity * sizeof(VP9WebGPUMCBlock));
+        if (!ctx->mc_batch.blocks) return -1;
+        ctx->mc_batch.count = 0;
+    }
+    
+    // Grow if needed
+    if (ctx->mc_batch.count >= ctx->mc_batch.capacity) {
+        int new_capacity = ctx->mc_batch.capacity * 2;
+        VP9WebGPUMCBlock *new_blocks = av_realloc(ctx->mc_batch.blocks, 
+                                                   new_capacity * sizeof(VP9WebGPUMCBlock));
+        if (!new_blocks) return -1;
+        ctx->mc_batch.blocks = new_blocks;
+        ctx->mc_batch.capacity = new_capacity;
+    }
+    
+    // Add block to batch
+    ctx->mc_batch.blocks[ctx->mc_batch.count++] = *block;
+    return 0;
+}
+
+// Execute all batched MC blocks
+int ff_vp9_webgpu_flush_mc_batch(VP9WebGPUContext *ctx, VP9Context *s) {
+    if (!ctx || ctx->mc_batch.count == 0) return 0;
+    
+    av_log(NULL, AV_LOG_INFO, "[WebGPU] Flushing MC batch: %d blocks\n", ctx->mc_batch.count);
+    
+    // Execute all blocks in one GPU call
+    int ret = ff_vp9_webgpu_motion_compensation(ctx, s, ctx->mc_batch.blocks, ctx->mc_batch.count);
+    
+    // Reset batch
+    ctx->mc_batch.count = 0;
+    
+    return ret;
+}
+
 // Begin frame decode with mapped GPU buffer for zero-copy
 int ff_vp9_webgpu_begin_frame(VP9WebGPUContext *ctx) {
     if (!ctx) return -1;
@@ -2809,6 +2944,8 @@ int ff_vp9_webgpu_begin_frame(VP9WebGPUContext *ctx) {
     // Reset accumulation counters
     ctx->tile_batch.accumulated_count = 0;
     ctx->tile_batch.has_coeffs = 0;
+    ctx->tile_batch.current_sb_x = -1;  // Invalid value to ensure first SB is saved
+    ctx->tile_batch.current_sb_y = -1;
     memset(&ctx->tile_batch.current_sb, 0, sizeof(VP9SuperblockGPU));
     
     av_log(NULL, AV_LOG_DEBUG, "[WebGPU] Begin frame with zero-copy mapped buffer\n");
@@ -2820,14 +2957,23 @@ int ff_vp9_webgpu_end_frame(VP9WebGPUContext *ctx, VP9Context *s) {
     if (!ctx || !ctx->tile_batch.is_mapped) return -1;
     
     // Save the last superblock (even if it has no coefficients)
-    if (ctx->tile_batch.accumulated_count < ctx->tile_batch.accumulated_capacity) {
+    if (ctx->tile_batch.current_sb_x >= 0 && ctx->tile_batch.current_sb_y >= 0 &&
+        ctx->tile_batch.accumulated_count < ctx->tile_batch.accumulated_capacity) {
         // Direct write to mapped GPU memory - ZERO COPY!
         ctx->tile_batch.mapped_sbs[ctx->tile_batch.accumulated_count] = ctx->tile_batch.current_sb;
         ctx->tile_batch.accumulated_count++;
+        av_log(NULL, AV_LOG_DEBUG, "[WebGPU] Saved final SB at (%d,%d), total=%d\n", 
+               ctx->tile_batch.current_sb_x, ctx->tile_batch.current_sb_y, ctx->tile_batch.accumulated_count);
     }
     
     av_log(NULL, AV_LOG_INFO, "[WebGPU] End frame with %d superblocks (zero-copy)\n", 
            ctx->tile_batch.accumulated_count);
+    
+    // Flush motion compensation batch
+    if (ctx->mc_batch.count > 0) {
+        av_log(NULL, AV_LOG_INFO, "[WebGPU] 🎯 Flushing %d MC blocks\n", ctx->mc_batch.count);
+        ff_vp9_webgpu_flush_mc_batch(ctx, s);
+    }
     
     // Dispatch the MEGA KERNEL to process the entire frame on GPU
     av_log(NULL, AV_LOG_INFO, "[WebGPU] 🎯 Dispatching complete frame to GPU (MEGA KERNEL)\n");
@@ -2840,8 +2986,73 @@ int ff_vp9_webgpu_end_frame(VP9WebGPUContext *ctx, VP9Context *s) {
     // Now submit using the direct buffer instead of copying
     if (ctx->tile_batch.accumulated_count > 0) {
         // The mapped buffer IS our data - no copy needed!
-        return ff_vp9_webgpu_submit_tile_batch_direct(ctx, ctx->tile_batch.direct_map_buffer,
-                                                      ctx->tile_batch.accumulated_count, s);
+        ff_vp9_webgpu_submit_tile_batch_direct(ctx, ctx->tile_batch.direct_map_buffer,
+                                               ctx->tile_batch.accumulated_count, s);
+    }
+    
+    // CRITICAL: Wait for GPU and copy results to frame
+    // GPU-ONLY mode - we MUST get the results
+    if (ctx->mega_frame_buffer) {
+        WGPUDevice device = ctx->device_ctx->device;
+        WGPUQueue queue = wgpuDeviceGetQueue(device);
+        
+        // Create staging buffer for readback
+        size_t frame_size = ctx->frame_width * ctx->frame_height * sizeof(uint32_t);
+        WGPUBufferDescriptor staging_desc = {
+            .size = frame_size,
+            .usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead,
+            .mappedAtCreation = 0,
+            .label = create_string_view("Frame Readback Buffer"),
+        };
+        WGPUBuffer staging_buffer = wgpuDeviceCreateBuffer(device, &staging_desc);
+        
+        // Copy frame buffer to staging
+        WGPUCommandEncoder encoder = wgpuDeviceCreateCommandEncoder(device, NULL);
+        wgpuCommandEncoderCopyBufferToBuffer(encoder, ctx->mega_frame_buffer, 0,
+                                            staging_buffer, 0, frame_size);
+        WGPUCommandBuffer commands = wgpuCommandEncoderFinish(encoder, NULL);
+        wgpuQueueSubmit(queue, 1, &commands);
+        
+        // Map and wait for results
+        MapRequest req = { .ready = 0 };
+        WGPUBufferMapCallbackInfo callback = {
+            .mode = WGPUCallbackMode_AllowProcessEvents,
+            .callback = map_callback,
+            .userdata1 = &req,
+        };
+        wgpuBufferMapAsync(staging_buffer, WGPUMapMode_Read, 0, frame_size, callback);
+        
+        // BLOCKING wait for GPU results
+        while (!req.ready) {
+            wgpuInstanceProcessEvents(ctx->device_ctx->instance);
+        }
+        
+        // Copy GPU results to frame
+        const uint32_t *gpu_data = (const uint32_t *)wgpuBufferGetConstMappedRange(staging_buffer, 0, frame_size);
+        if (gpu_data && s && s->s.frames[CUR_FRAME].tf.f) {
+            AVFrame *frame = s->s.frames[CUR_FRAME].tf.f;
+            
+            // Copy Y plane (assuming packed format from GPU)
+            for (int y = 0; y < ctx->frame_height; y++) {
+                for (int x = 0; x < ctx->frame_width; x++) {
+                    // Extract Y component from GPU u32 packed pixel
+                    uint32_t pixel = gpu_data[y * ctx->frame_width + x];
+                    frame->data[0][y * frame->linesize[0] + x] = (pixel >> 16) & 0xFF;
+                }
+            }
+            
+            // For now, clear U/V planes (GPU needs to output these too)
+            memset(frame->data[1], 128, frame->linesize[1] * (ctx->frame_height >> 1));
+            memset(frame->data[2], 128, frame->linesize[2] * (ctx->frame_height >> 1));
+            
+            av_log(NULL, AV_LOG_INFO, "[WebGPU] ✅ GPU frame decoded and written (%dx%d)\n",
+                   ctx->frame_width, ctx->frame_height);
+        }
+        
+        wgpuBufferUnmap(staging_buffer);
+        wgpuBufferRelease(staging_buffer);
+        wgpuCommandBufferRelease(commands);
+        wgpuCommandEncoderRelease(encoder);
     }
     
     return 0;

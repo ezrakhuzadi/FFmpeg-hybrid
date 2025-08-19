@@ -1385,7 +1385,12 @@ void ff_vp9_decode_block(VP9TileData *td, int row, int col,
         td->dst[2] = f->data[2] + uvoff;
         td->uv_stride = f->linesize[1];
     }
+    
     if (b->intra) {
+#if CONFIG_WEBGPU
+        // For GPU processing, still call the recon functions for accumulation
+        // but they will skip the actual CPU decode work internally
+#endif
         if (s->s.h.bpp > 8) {
             ff_vp9_intra_recon_16bpp(td, yoff, uvoff);
         } else {
