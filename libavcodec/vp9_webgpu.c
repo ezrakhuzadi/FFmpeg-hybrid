@@ -2598,7 +2598,8 @@ void ff_vp9_webgpu_dispatch_complete_frame(VP9WebGPUContext *ctx, VP9Context *s)
     WGPUComputePipeline pipeline = ctx->mega_kernel_pipeline ? ctx->mega_kernel_pipeline : ctx->superblock_pipeline;
     
     if (ctx->mega_kernel_pipeline) {
-        av_log(NULL, AV_LOG_INFO, "[WebGPU] 🔥 Dispatching MEGA KERNEL for %d superblocks\n", total_superblocks);
+        av_log(NULL, AV_LOG_INFO, "[WebGPU] 🔥 Dispatching MEGA KERNEL for %d actual superblocks (max %d)\n", 
+               ctx->tile_batch.accumulated_count, total_superblocks);
     }
     
     wgpuComputePassEncoderSetPipeline(pass, pipeline);
@@ -2738,13 +2739,12 @@ void ff_vp9_webgpu_dispatch_complete_frame(VP9WebGPUContext *ctx, VP9Context *s)
     
     // Single dispatch for entire frame - MASSIVE parallelism
     // Each workgroup processes ONE superblock with 64 threads
-    // For 8K: 8192/64 * 4096/64 = 8192 superblocks = 8192 workgroups
-    // For 4K: 3840/64 * 2160/64 = 2040 superblocks = 2040 workgroups
-    uint32_t num_workgroups = total_superblocks;  // One workgroup per superblock
+    // Use actual accumulated count, not maximum possible
+    uint32_t num_workgroups = ctx->tile_batch.accumulated_count;  // Actual superblocks with data
     
     // Actually dispatch to GPU
     wgpuComputePassEncoderDispatchWorkgroups(pass, num_workgroups, 1, 1);
-    av_log(NULL, AV_LOG_INFO, "[WebGPU] GPU DISPATCH: %d workgroups (one per superblock, 64 threads each)\n", num_workgroups);
+    av_log(NULL, AV_LOG_INFO, "[WebGPU] GPU DISPATCH: %d workgroups (actual SBs with data, 64 threads each)\n", num_workgroups);
     
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
