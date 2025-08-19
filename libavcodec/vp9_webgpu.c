@@ -2308,8 +2308,8 @@ void ff_vp9_webgpu_accumulate_block_coeffs(VP9WebGPUContext *ctx,
     
     // If this is a new superblock, save the old one and start fresh
     if (sb_x != ctx->tile_batch.current_sb_x || sb_y != ctx->tile_batch.current_sb_y) {
-        // Save previous superblock if it had coefficients
-        if (ctx->tile_batch.has_coeffs && ctx->tile_batch.accumulated_count < ctx->tile_batch.accumulated_capacity) {
+        // Save ALL superblocks for GPU processing (even if all coefficients are zero)
+        if (ctx->tile_batch.accumulated_count < ctx->tile_batch.accumulated_capacity) {
             av_log(NULL, AV_LOG_DEBUG, "[WebGPU] Storing completed SB(%d,%d) with coefficients at index %d\n", 
                    ctx->tile_batch.current_sb_x, ctx->tile_batch.current_sb_y, ctx->tile_batch.accumulated_count);
             
@@ -2685,58 +2685,66 @@ void ff_vp9_webgpu_dispatch_complete_frame(VP9WebGPUContext *ctx, VP9Context *s)
             { .binding = 4, .sampler = ctx->mega_sampler },
         };
         
-        // Create bind group entries
-        WGPUBindGroupEntry entries[] = {
-            { .binding = 0, .buffer = uniform_buffer, .size = sizeof(frame_info) },
-            { .binding = 1, .buffer = sb_buffer, .size = sb_buffer_size },
-            { .binding = 2, .buffer = frame_buffer, .size = wgpuBufferGetSize(frame_buffer) },
-            { .binding = 3, .textureView = ref_view },
-            { .binding = 4, .sampler = ref_sampler },
-        };
-        
         WGPUBindGroupDescriptor bind_desc = {
             .layout = wgpuComputePipelineGetBindGroupLayout(ctx->mega_kernel_pipeline, 0),
             .entryCount = 5,
             .entries = entries,
-            .label = create_string_view("Mega Kernel Bind Group"),
+            .label = create_string_view("Persistent Mega Kernel Bind Group"),
         };
         
-        av_log(NULL, AV_LOG_INFO, "[WebGPU] Creating bind group...\n");
-        WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(device, &bind_desc);
-        if (!bind_group) {
-            av_log(NULL, AV_LOG_ERROR, "[WebGPU] Failed to create bind group!\n");
-            // Clean up and continue without bind group
-            wgpuBufferRelease(uniform_buffer);
-            wgpuBufferRelease(sb_buffer);
-            wgpuTextureViewRelease(ref_view);
-            wgpuTextureRelease(ref_texture);
-            wgpuSamplerRelease(ref_sampler);
-            wgpuBufferRelease(frame_buffer);
-        } else {
-            av_log(NULL, AV_LOG_INFO, "[WebGPU] Bind group created, setting on compute pass...\n");
-            wgpuComputePassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
-            
-            // Clean up temporary resources after dispatch
-            // Note: In production, these would be persistent and reused
-            wgpuBufferRelease(uniform_buffer);
-            wgpuBufferRelease(sb_buffer);
-            wgpuTextureViewRelease(ref_view);
-            wgpuTextureRelease(ref_texture);
-            wgpuSamplerRelease(ref_sampler);
-            wgpuBufferRelease(frame_buffer);
-            wgpuBindGroupRelease(bind_group);
+        ctx->mega_bind_group = wgpuDeviceCreateBindGroup(device, &bind_desc);
+        if (!ctx->mega_bind_group) {
+            av_log(NULL, AV_LOG_ERROR, "[WebGPU] Failed to create persistent bind group!\n");
+            return;
         }
+        
+        ctx->mega_resources_initialized = 1;
+        av_log(NULL, AV_LOG_INFO, "[WebGPU] ✅ Persistent GPU resources created - NO MORE ALLOCATION OVERHEAD\n");
+    }
+    
+    // Upload current frame's superblock data to persistent buffer
+    if (ctx->mega_kernel_pipeline && ctx->mega_resources_initialized) {
+        size_t sb_struct_size = 1024 * sizeof(int32_t) + 7 * sizeof(uint32_t);
+        size_t upload_size = total_superblocks * sb_struct_size;
+        
+        if (ctx->soa_data && ctx->soa_data->sb_count > 0) {
+            // Convert SOA to AOS for GPU
+            uint8_t *temp_data = av_malloc(upload_size);
+            if (temp_data) {
+                for (int i = 0; i < total_superblocks && i < ctx->soa_data->sb_count; i++) {
+                    uint8_t *sb_ptr = temp_data + i * sb_struct_size;
+                    
+                    // Copy coefficients
+                    memcpy(sb_ptr, ctx->soa_data->all_coefficients[i], 1024 * sizeof(int32_t));
+                    sb_ptr += 1024 * sizeof(int32_t);
+                    
+                    // Copy metadata
+                    ((uint32_t*)sb_ptr)[0] = ctx->soa_data->sb_x_coords[i];
+                    ((uint32_t*)sb_ptr)[1] = ctx->soa_data->sb_y_coords[i];
+                    ((uint32_t*)sb_ptr)[2] = ctx->soa_data->all_modes[i];
+                    ((uint32_t*)sb_ptr)[3] = (uint32_t)ctx->soa_data->all_mvs[i][0];
+                    ((uint32_t*)sb_ptr)[4] = (uint32_t)ctx->soa_data->all_mvs[i][1];
+                    ((uint32_t*)sb_ptr)[5] = ctx->soa_data->partition_masks[i];
+                    ((uint32_t*)sb_ptr)[6] = ctx->soa_data->transform_masks[i];
+                }
+                wgpuQueueWriteBuffer(queue, ctx->mega_superblock_buffer, 0, temp_data, upload_size);
+                av_free(temp_data);
+            }
+        }
+        
+        // Set the persistent bind group
+        wgpuComputePassEncoderSetBindGroup(pass, 0, ctx->mega_bind_group, 0, NULL);
     }
     
     // Single dispatch for entire frame - MASSIVE parallelism
-    // For 8K: 8192/64 * 4096/64 = 8192 superblocks processed simultaneously!
-    // For 4K: 3840/64 * 2160/64 = 2040 superblocks processed simultaneously!
-    uint32_t workgroup_size = ff_vp9_webgpu_calculate_optimal_workgroup_size(ctx, ctx->frame_width, ctx->frame_height);
-    uint32_t num_workgroups = (total_superblocks + workgroup_size - 1) / workgroup_size;
+    // Each workgroup processes ONE superblock with 64 threads
+    // For 8K: 8192/64 * 4096/64 = 8192 superblocks = 8192 workgroups
+    // For 4K: 3840/64 * 2160/64 = 2040 superblocks = 2040 workgroups
+    uint32_t num_workgroups = total_superblocks;  // One workgroup per superblock
     
     // Actually dispatch to GPU
     wgpuComputePassEncoderDispatchWorkgroups(pass, num_workgroups, 1, 1);
-    av_log(NULL, AV_LOG_INFO, "[WebGPU] GPU DISPATCH: %d workgroups of size %d\n", num_workgroups, workgroup_size);
+    av_log(NULL, AV_LOG_INFO, "[WebGPU] GPU DISPATCH: %d workgroups (one per superblock, 64 threads each)\n", num_workgroups);
     
     wgpuComputePassEncoderEnd(pass);
     wgpuComputePassEncoderRelease(pass);
@@ -2811,8 +2819,8 @@ int ff_vp9_webgpu_begin_frame(VP9WebGPUContext *ctx) {
 int ff_vp9_webgpu_end_frame(VP9WebGPUContext *ctx, VP9Context *s) {
     if (!ctx || !ctx->tile_batch.is_mapped) return -1;
     
-    // Save the last superblock if it has coefficients
-    if (ctx->tile_batch.has_coeffs && ctx->tile_batch.accumulated_count < ctx->tile_batch.accumulated_capacity) {
+    // Save the last superblock (even if it has no coefficients)
+    if (ctx->tile_batch.accumulated_count < ctx->tile_batch.accumulated_capacity) {
         // Direct write to mapped GPU memory - ZERO COPY!
         ctx->tile_batch.mapped_sbs[ctx->tile_batch.accumulated_count] = ctx->tile_batch.current_sb;
         ctx->tile_batch.accumulated_count++;
